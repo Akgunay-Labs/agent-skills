@@ -224,6 +224,11 @@ class ModeB(unittest.TestCase):
         self.assertEqual(ra.readiness({"foreground": {"name": "claude"}}, [], "❯ \n ? for shortcuts", 25, "claude"), "ready")
         self.assertEqual(ra.readiness({"foreground": {"name": "claude"}}, [], "", 5, "claude"), "starting")
 
+    def test_readiness_detects_startup_dialog(self):
+        cap = "Do you trust the files in this folder?\n ❯ Yes, I trust this folder\n   No, exit"
+        self.assertEqual(ra.readiness({"foreground": {"name": "claude"}}, [{"ev": "session_start"}], cap, 5, "claude"), "blocked:startup-dialog")
+        self.assertEqual(ra.readiness({"foreground": {"name": "claude"}}, [], "Do you want to proceed?\n ❯ 1. Yes", 25, "claude"), "blocked:startup-dialog")
+
     def test_readiness_timeout_is_failed_launch(self):
         self.assertEqual(ra.readiness({"foreground": {"name": "zsh"}}, [], "", 31, "claude"), "failed:launch")
 

@@ -235,10 +235,15 @@ def watch_outcome(turns, events, sent_at):
     return "no-fresh-evidence", evidence
 
 
+STARTUP_DIALOGS = ("trust the files in this folder", "Yes, I trust", "Do you want to proceed", "Esc to cancel")
+
+
 def readiness(process, turns, capture, elapsed, agent):
     fg = (process.get("foreground") or {}).get("name")
     if fg != agent:
         return "failed:launch" if elapsed > 30 else "starting"
+    if any(m in capture for m in STARTUP_DIALOGS):
+        return "blocked:startup-dialog"
     if any(t.get("ev") == "session_start" for t in turns):
         return "ready"
     if elapsed >= 20 and any(m in capture for m in ("❯", "›", "shortcuts")):
@@ -369,6 +374,9 @@ def wait_ready(rec, limit=35):
         if st == "ready":
             rec["ready_at"] = now_iso()
             return "ready"
+        if st.startswith("blocked"):
+            rec["last_capture"] = cap[-800:]
+            return st  # a person must answer the dialog; send stays refused (not-ready)
         if st.startswith("failed") or time.time() - t0 > limit:
             rec["last_capture"] = cap[-800:]
             return "failed:launch"
