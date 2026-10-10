@@ -54,5 +54,7 @@ The worker's pane is visible in the Rex app, and the person at the keyboard can 
 
 ## Open items
 
+- Codex per-launch `notify` did not fire when launched by the helper (interpreter, run-dir path and writable-root were ruled in and out without a clean result); the manual `sh -c echo` form did fire in experiments. Codex's native `app=codex` status records carry `watch` (`turn-ended:status`) in the meantime; `codex queue` therefore has no thread id from markers yet (read it from `~/.codex/sessions` only if the user allows).
+
 - `turn-ended:heuristic` has not been observed in a real run (**assumption** that bell plus idle is the right pair); hooks were present in every live test.
 - Codex Desktop driving a Mode B worker end to end is untested.

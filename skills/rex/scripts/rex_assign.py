@@ -45,13 +45,16 @@ def brief_pointer(run_dir):
     return f"Read {run_dir}/brief.md and do exactly what it says."
 
 
+PYTHON = sys.executable  # absolute: hook and notify subprocesses may run with a minimal PATH inside a sandbox
+
+
 def codex_notify_override(assignment_id, helper=HELPER):
-    return "notify=" + json.dumps(["python3", "-I", str(helper), "notify", assignment_id])
+    return "notify=" + json.dumps([PYTHON, "-I", str(helper), "notify", assignment_id])
 
 
 def interactive_claude_settings(assignment_id, helper=HELPER, osc=False):
     def hook(ev):
-        cmd = f"python3 -I {shlex.quote(str(helper))} notify {assignment_id} --ev {ev}" + (" --osc" if osc else "")
+        cmd = f"{shlex.quote(PYTHON)} -I {shlex.quote(str(helper))} notify {assignment_id} --ev {ev}" + (" --osc" if osc else "")
         return [{"hooks": [{"type": "command", "command": cmd}]}]
     return {"preferredNotifChannel": "terminal_bell",
             "hooks": {"SessionStart": hook("session_start"), "UserPromptSubmit": hook("prompt"),
@@ -110,7 +113,8 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
                 parts += ["--worktree"]
             parts += [prompt]
             return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "events.jsonl"))
-        parts = ["exec", "codex", "--no-daemon", "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all"]
+        parts = ["exec", "codex", "--no-daemon", "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all",
+                 "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(run_dir)])]  # notify appends to RUN_DIR/turns.jsonl from inside the sandbox
         if model:
             parts += ["-m", model]
         return " ".join(q(p) for p in parts)

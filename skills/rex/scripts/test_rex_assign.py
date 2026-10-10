@@ -48,6 +48,11 @@ class CommandBuilding(unittest.TestCase):
         self.assertTrue(any(x.startswith("notify=[") and "rex_assign.py" in x and "a-1" in x for x in parts))
         self.assertIn("shell_environment_policy.inherit=all", parts)
 
+    def test_interactive_codex_makes_run_dir_writable_for_notify(self):
+        p = ra.build_worker_command("codex", "interactive", ra.Policy("default", []), RUN, None, assignment_id="a-1", helper=RUN / "rex_assign.py")
+        parts = shlex.split(p)
+        self.assertTrue(any(x.startswith("sandbox_workspace_write.writable_roots=") and str(RUN) in x for x in parts))
+
     def test_split_argv_has_explicit_session_and_anchor_and_no_focus(self):
         argv = ra.build_rex_create_argv(S, anchor=B, split="right", new_window=False, label="a-1", cwd="/repo", payload="exec true")
         self.assertEqual(argv[:2], ["rex", "split"])
@@ -193,6 +198,13 @@ class ModeB(unittest.TestCase):
         self.assertTrue(v.startswith("notify=["))
         self.assertIn("/x/rex_assign.py", v)
         self.assertIn("a-1", v)
+
+    def test_hook_and_notify_commands_use_absolute_interpreter(self):
+        v = json.loads(ra.codex_notify_override("a-1", pathlib.Path("/x/rex_assign.py"))[len("notify="):])
+        self.assertEqual(v[0], sys.executable)
+        self.assertTrue(os.path.isabs(v[0]))
+        cmd = ra.interactive_claude_settings("a-1", pathlib.Path("/x/rex_assign.py"))["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(cmd)[0], sys.executable)
 
     def rec(self, owner=B):
         return {"owner": {"block_id": owner}, "target": {"block_id": "block:01a1-w"}, "worker": {"agent": "claude"}, "ready_at": "2026-10-10T00:00:00Z"}
