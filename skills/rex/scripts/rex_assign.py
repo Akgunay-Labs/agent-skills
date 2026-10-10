@@ -148,6 +148,13 @@ def classify(exit_code, result_path, agent):
     return "exited-without-result", "no turn.completed in events.jsonl"
 
 
+def resolve_owner(as_owner, whoami):
+    """(kind, block_id): an explicit --as-owner always wins; otherwise the caller's own pane from whoami."""
+    if as_owner:
+        return "external", as_owner
+    return ("lead-in-rex", whoami.get("block_id")) if whoami.get("block_id") else ("external", None)
+
+
 def check_server(stored_server, whoami):
     if stored_server.get("instance_id") and stored_server.get("instance_id") != whoami.get("instance_id"):
         return "abandoned:server-restarted"
@@ -301,7 +308,7 @@ def cmd_launch(a):
     created = json.loads(r.stdout)
     block_id = created["block_ids"][0]
     rec = {"assignment_id": aid, "role": a.role,
-           "owner": {"kind": "lead-in-rex" if who.get("block_id") else "external", "block_id": who.get("block_id") or a.as_owner, "controller": a.controller},
+           "owner": dict(zip(("kind", "block_id"), resolve_owner(a.as_owner, who)), controller=a.controller),
            "server": {"endpoint": who.get("endpoint"), "instance_id": who.get("instance_id"), "host_id": who.get("host_id")},
            "target": {"session_id": a.session, "window_id": created.get("window_id"), "block_id": block_id, "label": a.label or aid},
            "worker": {"agent": a.agent, "mode": a.mode, "model": a.model, "effort": a.effort,

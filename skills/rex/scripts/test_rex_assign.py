@@ -112,6 +112,11 @@ class Classification(unittest.TestCase):
     def test_interrupt_leaves_interactive_worker_ready(self):
         self.assertEqual(ra.cancel_state("working", alive=True, close=False), "ready")
 
+    def test_explicit_owner_wins_over_whoami(self):
+        self.assertEqual(ra.resolve_owner("block:explicit", {"block_id": "block:mine"}), ("external", "block:explicit"))
+        self.assertEqual(ra.resolve_owner(None, {"block_id": "block:mine"}), ("lead-in-rex", "block:mine"))
+        self.assertEqual(ra.resolve_owner(None, {"block_id": None}), ("external", None))
+
     def test_states_never_say_accepted_without_review(self):
         for st in ra.TERMINAL_STATES:
             self.assertNotEqual(st, "accepted")
