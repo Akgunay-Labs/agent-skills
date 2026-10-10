@@ -41,13 +41,13 @@ Codex worker command (**live**):
 exec codex exec --approve-for-me -c shell_environment_policy.inherit=all --skip-git-repo-check \
   --json -o RUN/last-message.md [-m MODEL] [-C CWD] [--worktree] 'Read RUN/brief.md …' > RUN/events.jsonl
 ```
-Without `--approve-for-me` every command needing approval is rejected in exec mode (**live**). `-c shell_environment_policy.inherit=all` is what lets the worker's own `rex` calls see `REX_*` (**live**).
+`-s` carries the recorded policy (`read-only` | `workspace-write` | `danger-full-access`; `plan` maps to read-only). Without `--approve-for-me` every command needing approval is rejected in exec mode (**live**). `-c shell_environment_policy.inherit=all` is what lets the worker's own `rex` calls see `REX_*` (**live**). The `--add-dir` form has not completed a live run yet (**assumption**; row 11 deferred).
 
 `rex` creation (**live**): `rex split -s S -b ANCHOR --split right --focus=false --keep-open --label AID --cwd CWD --json -- sh -c '<payload>'`, or `rex run -s S …` for a new window. `--focus=false` keeps the lead's focus. The login shell's environment applies (PATH has Homebrew and Rex), not its rc files; `--shell=none` loses that PATH.
 
 ## Wait and classify
 
-`rex wait -s S --for 30m --json BLOCK` (**docs/live**): returns the child's exit status; prints `{"exit_code":N[,"error":…]}` on exit; on timeout prints no JSON, writes "wait timed out" to stderr and exits 1. So "exit 1 with payload" is a failed worker and "exit 1 without payload" is a timeout. A child exit of 2 makes `rex wait` print its own usage text as well (**live**, harmless).
+`rex wait -s S --for 30m --json BLOCK` (**docs/live**): returns the child's exit status; prints `{"exit_code":N[,"error":…]}` on exit; on timeout prints no JSON, writes "wait timed out" to stderr and exits 1. The helper classifies the worker only from a payload or a timeout; rex-side outcomes (exit 3 block gone → `abandoned:block-closed`; exit 4 server unreachable; exit 130 the lead's own Ctrl+C) leave the record untouched and say the worker may still be running. `wait` and `status` check `instance_id` first and record `abandoned:server-restarted` before touching the block. A child exit of 2 makes `rex wait` print its own usage text as well (**live**, harmless).
 
 Claude `result.json` (**live**): `type=result`, `subtype` (`success` | `error_max_turns` | `error_during_execution` …), `is_error`, `result`, `session_id`, `permission_denials[]` (`tool_name`, `tool_input`), `terminal_reason`, `num_turns`, `total_cost_usd`, `duration_ms`.
 
@@ -70,11 +70,11 @@ Executor brief ends with the `REPORT.md` request (what changed, how verified, wh
 ```json
 {"verdict": "accepted" | "changes-requested", "findings": [{"file": "", "line": 0, "summary": ""}]}
 ```
-Record it with `review <executor-id> --reviewer <reviewer-id>` (or `--from-file review.json`); the helper refuses verdicts other than the two above and refuses to review an assignment that did not complete. `changes-requested` → `resume <executor> --brief findings.md` (the resumed run keeps the original agent session id in its record). Nothing else moves an assignment to `accepted`. Two workers never share a working tree: PR work uses `--worktree` (`claude --worktree` / `codex exec --worktree`); never `git worktree add` from a shell.
+Record it with `review <executor-id> --reviewer <reviewer-id>` (or `--from-file review.json`); the helper accepts only the two verdicts and only on `completed-unreviewed` or `completed-with-denials` records (never `completed-without-deliverable`). `changes-requested` → `resume <executor> --brief findings.md` (the resumed run keeps the original agent session id in its record). Nothing else moves an assignment to `accepted`. Two workers never share a working tree: PR work uses `--worktree` (`claude --worktree` / `codex exec --worktree`); never `git worktree add` from a shell.
 
 ## Cancel, timeout, exit, recovery (**live** unless noted)
 
-- **Cancel:** `cancel <id>` sends `ctrl+c` only if the foreground process is the agent, waits 15 s, then `--close` closes the block (which kills the child). Finished states survive a close.
+- **Cancel:** `cancel <id>` (owner only; exit 6 otherwise) sends `ctrl+c` only if the foreground process is the agent, waits 15 s, then `--close` closes the block (which kills the child). Every non-live state survives a close: completed, failed, `accepted`, `changes-requested`, abandoned. A `wait` re-run never regresses a reviewed record.
 - **Timeout:** a decision point. `status <id>` shows process, status records with freshness, marker tail, screen tail. Extend with another `wait`, or `cancel`.
 - **Nonzero exit, no result:** launch failure. Common causes: redirect path missing, PATH (use the login shell, not `--shell=none`), auth. Quote the screen tail in your report.
 - **Block gone** (`rex` exit 3 on a stored full ID): `abandoned:block-closed`. `resume` works only if the agent's session exists on disk; a Claude worker killed before its first turn completed has no transcript ("No conversation found") → `abandoned:no-transcript`, relaunch with the same brief.

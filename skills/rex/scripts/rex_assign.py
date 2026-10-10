@@ -15,7 +15,8 @@ HELPER = pathlib.Path(__file__).resolve()
 RUNS_ROOT = pathlib.Path(os.environ.get("REX_ORCH_RUNS", str(pathlib.Path.home() / ".local/state/rex-orch/runs")))
 REX_FALLBACK = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex"
 AGENTS = ("claude", "codex")
-TERMINAL_STATES = ("completed-unreviewed", "completed-with-denials", "failed", "exited-without-result", "timeout", "cancelled")
+TERMINAL_STATES = ("completed-unreviewed", "completed-with-denials", "failed", "exited-without-result", "cancelled")
+LIVE_STATES = ("launched", "ready", "working", "exited", "timeout")  # a worker may still be running; also blocked:* and taken-over:*
 EXIT_USAGE, EXIT_TARGET, EXIT_SERVER, EXIT_MARKER, EXIT_GUARD = 2, 3, 4, 5, 6
 
 
@@ -48,13 +49,14 @@ def brief_pointer(run_dir):
 PYTHON = sys.executable  # absolute: hook and notify subprocesses may run with a minimal PATH inside a sandbox
 
 
-def codex_notify_override(assignment_id, helper=HELPER):
-    return "notify=" + json.dumps([PYTHON, "-I", str(helper), "notify", assignment_id])
+def codex_notify_override(assignment_id, helper=HELPER, runs_root=None):
+    return "notify=" + json.dumps([PYTHON, "-I", str(helper), "--runs-root", str(runs_root or RUNS_ROOT), "notify", assignment_id])
 
 
-def interactive_claude_settings(assignment_id, helper=HELPER, osc=False):
+def interactive_claude_settings(assignment_id, helper=HELPER, osc=False, runs_root=None):
     def hook(ev):
-        cmd = f"{shlex.quote(PYTHON)} -I {shlex.quote(str(helper))} notify {assignment_id} --ev {ev}" + (" --osc" if osc else "")
+        cmd = (f"{shlex.quote(PYTHON)} -I {shlex.quote(str(helper))} --runs-root {shlex.quote(str(runs_root or RUNS_ROOT))} "
+               f"notify {assignment_id} --ev {ev}" + (" --osc" if osc else ""))
         return [{"hooks": [{"type": "command", "command": cmd}]}]
     return {"preferredNotifChannel": "terminal_bell",
             "hooks": {"SessionStart": hook("session_start"), "UserPromptSubmit": hook("prompt"),
@@ -68,6 +70,20 @@ def stage_helper(run_dir):
     dst = pathlib.Path(run_dir) / "rex_assign.py"
     shutil.copyfile(HELPER, dst)
     return dst
+
+
+CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+STARTUP_DIALOGS = ("trust the files in this folder", "Yes, I trust", "Do you want to proceed", "Esc to cancel")
+
+
+def codex_sandbox(policy):
+    """Map the recorded policy to a Codex sandbox; Claude-style names fall back to workspace-write."""
+    return policy.mode if policy.mode in CODEX_SANDBOXES else ("read-only" if policy.mode == "plan" else "workspace-write")
+
+
+def dialog_open(capture):
+    """True when the screen shows a dialog that a person must answer (Claude or Codex)."""
+    return any(m in capture for m in STARTUP_DIALOGS + ("Allow command", "Would you like to run", "Approve", "Esc to cancel"))
 
 
 def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=None, effort=None,
@@ -96,6 +112,8 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
             parts += (["--resume", resume_of] if resume_of else ["--session-id", agent_session_id])
             parts += ["--name", aid, prompt]  # --name is not variadic, so the prompt is safe after it
             return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "result.json"))
+        if policy.allow:
+            parts += ["--allowedTools", *policy.allow]
         parts += ["--settings", str(run_dir / "claude-settings.json"), "--session-id", agent_session_id, "--name", aid]
         return " ".join(q(p) for p in parts)
     if agent == "codex":
@@ -103,7 +121,7 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
             parts = ["exec", "codex", "exec"]
             if resume_of:
                 parts += ["resume", resume_of]
-            parts += ["--approve-for-me", "-c", "shell_environment_policy.inherit=all", "--skip-git-repo-check",
+            parts += ["--approve-for-me", "-s", codex_sandbox(policy), "-c", "shell_environment_policy.inherit=all", "--skip-git-repo-check",
                       "--json", "-o", str(run_dir / "last-message.md"), "--add-dir", str(run_dir)]
             if model:
                 parts += ["-m", model]
@@ -113,7 +131,7 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
                 parts += ["--worktree"]
             parts += [prompt]
             return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "events.jsonl"))
-        parts = ["exec", "codex", "--no-daemon", "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all",
+        parts = ["exec", "codex", "--no-daemon", "-s", codex_sandbox(policy), "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all",
                  "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(run_dir)])]  # notify appends to RUN_DIR/turns.jsonl from inside the sandbox
         if model:
             parts += ["-m", model]
@@ -210,7 +228,7 @@ def apply_deliverable(state, deliverable_path):
 
 def apply_review(rec, review, reviewer_id):
     """Record a reviewer's verdict on an executor record. Only this moves a record to accepted."""
-    if not str(rec.get("state", "")).startswith("completed"):
+    if rec.get("state") not in ("completed-unreviewed", "completed-with-denials"):
         raise ValueError(f"cannot review an assignment in state {rec.get('state')!r}")
     verdict = review.get("verdict")
     if verdict not in ("accepted", "changes-requested"):
@@ -249,7 +267,9 @@ def send_guards(record, process, turns, caller_block, capture=None):
         failing.append("blocked")
     if not record.get("ready_at"):
         failing.append("not-ready")
-    if capture is not None and input_has_text(capture):
+    if capture is not None and dialog_open(capture):
+        failing.append("dialog-open")
+    elif capture is not None and input_has_text(capture):
         failing.append("input-not-empty")
     return failing
 
@@ -292,7 +312,21 @@ def watch_outcome(turns, events, sent_at, sends=None):
     return "no-fresh-evidence", evidence
 
 
-STARTUP_DIALOGS = ("trust the files in this folder", "Yes, I trust", "Do you want to proceed", "Esc to cancel")
+def recover_ready(rec, process, turns, capture):
+    """Re-run readiness for an interactive record that never reached ready (slow start, dialog answered later)."""
+    st = readiness(process, turns, capture, 60, rec["worker"]["agent"])
+    if st == "ready":
+        rec["ready_at"] = now_iso(); rec["state"] = "ready"
+    return rec
+
+
+def owner_mismatch(rec, caller_block):
+    return (rec.get("owner") or {}).get("block_id") != caller_block
+
+
+def next_wait_state(rec, classified):
+    """A record that already carries a review keeps its verdict; wait never regresses it."""
+    return rec["state"] if rec.get("review") else classified
 
 
 def readiness(process, turns, capture, elapsed, agent):
@@ -390,7 +424,7 @@ def cmd_launch(a):
     agent_session_id = session_id_for(a.agent, a.resume_of, str(uuid.uuid4()))
     helper = stage_helper(run_dir) if a.mode == "interactive" else HELPER
     if a.mode == "interactive" and a.agent == "claude":
-        (run_dir / "claude-settings.json").write_text(json.dumps(interactive_claude_settings(aid, helper, osc=a.osc_status), indent=2))
+        (run_dir / "claude-settings.json").write_text(json.dumps(interactive_claude_settings(aid, helper, osc=a.osc_status, runs_root=RUNS_ROOT), indent=2))
     payload = build_worker_command(a.agent, a.mode, policy, run_dir, agent_session_id, model=a.model, effort=a.effort,
                                    worktree=a.worktree, cwd=a.cwd, assignment_id=aid, resume_of=a.resume_of, prompt=a.prompt, helper=helper)
     argv = build_rex_create_argv(a.session, a.anchor, a.split, a.new_window, a.label or aid, a.cwd, payload, rex=rex_bin())
@@ -443,6 +477,7 @@ def wait_ready(rec, limit=35):
 
 
 def parse_wait(rc, out):
+    """('exit', code) for a real child exit; otherwise the rex-side outcome: timeout, not-found, server-unreachable, interrupted, rex-error."""
     payload = None
     for line in out.splitlines():
         if line.startswith("{"):
@@ -450,19 +485,34 @@ def parse_wait(rc, out):
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 pass
-    if payload is None:
-        return None if rc == 1 else rc  # timeout prints no payload
-    return payload.get("exit_code", rc)
+    if payload is not None and "exit_code" in payload:
+        return "exit", payload["exit_code"]
+    return {1: ("timeout", None), 3: ("not-found", None), 4: ("server-unreachable", None), 130: ("interrupted", None)}.get(rc, ("rex-error", rc))
+
+
+def server_check(rec):
+    """Return a stale-state string when the server identity changed, None when fine, 'server-unreachable' when whoami fails."""
+    rc, who, _, _ = rex("whoami", "--json")
+    if rc != 0 or not who:
+        return "server-unreachable"
+    return check_server(rec.get("server", {}), who)
 
 
 def cmd_wait(a):
     rec = load_record(a.assignment_id)
     sid, b = rec["target"]["session_id"], rec["target"]["block_id"]
+    stale = server_check(rec)
+    if stale == "abandoned:server-restarted":
+        rec["state"] = stale; save_record(rec); print(json.dumps({"state": stale})); return 1
+    if stale == "server-unreachable":
+        print(json.dumps({"state": rec["state"], "detail": "rex server unreachable; record unchanged"})); return 1
     rc, _, out, err = rex("wait", "-s", sid, "--for", a.for_, "--json", b, json_out=False)
-    if rc == 3:
+    kind, exit_code = parse_wait(rc, out)
+    if kind == "not-found":
         rec["state"] = "abandoned:block-closed"; save_record(rec)
         print(json.dumps({"state": rec["state"], "detail": err.strip()})); return 1
-    exit_code = parse_wait(rc, out)
+    if kind in ("server-unreachable", "interrupted", "rex-error"):
+        print(json.dumps({"state": rec["state"], "detail": f"rex wait ended with {kind} ({err.strip()[:200]}); worker may still be running; record unchanged"})); return 1
     state, summary = classify(exit_code, rec["paths"]["result"], rec["worker"]["agent"])
     state = apply_deliverable(state, rec["paths"].get("deliverable"))
     if state == "completed-without-deliverable":
@@ -470,6 +520,7 @@ def cmd_wait(a):
     if state == "timeout" and a.cancel_on_timeout:
         do_cancel(rec, close=False); state = "cancelled"
     rec["exit"] = None if exit_code is None else {"code": exit_code, "at": now_iso()}
+    state = next_wait_state(rec, state)
     rec["state"] = state; save_record(rec)
     out_obj = {"assignment_id": rec["assignment_id"], "state": state, "exit": rec["exit"], "summary": summary, "result_path": rec["paths"]["result"]}
     print(json.dumps(out_obj, indent=2))
@@ -492,9 +543,13 @@ def cmd_review(a):
 def cmd_status(a):
     rec = load_record(a.assignment_id)
     sid, b = rec["target"]["session_id"], rec["target"]["block_id"]
-    rc, who, _, _ = rex("whoami", "--json")
-    stale = check_server(rec.get("server", {}), who or {}) if who else "server-unreachable"
+    stale = server_check(rec)
     info = {"assignment_id": rec["assignment_id"], "state": rec["state"], "server": stale or "same instance"}
+    if stale == "abandoned:server-restarted":
+        rec["state"] = stale; save_record(rec); info["state"] = stale
+        print(json.dumps(info, indent=2)); return 1
+    if stale == "server-unreachable":
+        print(json.dumps(info, indent=2)); return 1
     rc, proc = block_call(sid, b, "process")
     if rc == 3:
         rec["state"] = "abandoned:block-closed"; save_record(rec); info["state"] = rec["state"]
@@ -511,6 +566,8 @@ def cmd_status(a):
         info["live"] = {"outcome": live, "blocked_open": _blocked_open(turns), "note": "record.state is a cache; live is recomputed from markers and status now"}
     _, _, cap, _ = rex("capture", "-s", sid, "-b", b, "--trim", json_out=False)
     info["capture_tail"] = cap.splitlines()[-20:]
+    if rec["worker"]["mode"] == "interactive" and not rec.get("ready_at"):
+        recover_ready(rec, proc, turns, cap); save_record(rec); info["state"] = rec["state"]; info["ready_at"] = rec.get("ready_at")
     print(json.dumps(info, indent=2)); return 0
 
 
@@ -518,17 +575,25 @@ def cmd_send(a):
     rec = load_record(a.assignment_id)
     sid, b = rec["target"]["session_id"], rec["target"]["block_id"]
     caller = a.as_owner or os.environ.get("REX_BLOCK")
+    stale = server_check(rec)
+    if stale:
+        if stale.startswith("abandoned"):
+            rec["state"] = stale; save_record(rec)
+        print(f"send refused: {stale}", file=sys.stderr); return EXIT_TARGET
     rc, proc = block_call(sid, b, "process")
     if rc == 3:
+        rec["state"] = "abandoned:block-closed"; save_record(rec)
         print("target block not found (closed?)", file=sys.stderr); return EXIT_TARGET
     turns = read_turns(rec["paths"]["run_dir"])
     _, st = block_call(sid, b, "program_status")
     if any(r.get("state") == "blocked" for r in st.get("records", [])):
         turns = turns + [{"ev": "blocked", "ts": "9999", "notification_type": "rex-status"}]
     _, _, cap, _ = rex("capture", "-s", sid, "-b", b, "--trim", json_out=False)
+    if not rec.get("ready_at"):
+        recover_ready(rec, proc, turns, cap); save_record(rec)
     failing = send_guards(rec, proc, turns, caller, capture=cap)
     if failing:
-        hint = " (input box holds text: clear it first, e.g. rex send-key -s S -b B ctrl+u, or wait for the person)" if "input-not-empty" in failing else ""
+        hint = " (a dialog is on screen: a person must answer it)" if "dialog-open" in failing else (" (input box holds text: clear it first, e.g. rex send-key -s S -b B ctrl+u, or wait for the person)" if "input-not-empty" in failing else "")
         print("send refused; failing guards: " + ", ".join(failing) + hint, file=sys.stderr); return EXIT_GUARD
     text = a.text if a.text is not None else f"Read {a.brief} and do exactly what it says."
     sent = {"seq": len(rec.get("sends", [])) + 1, "sent_at": now_iso(), "capture_sha": hashlib.sha1(cap.encode()).hexdigest()[:12], "text": text[:200]}
@@ -615,8 +680,9 @@ def cmd_notify(a):
 def cancel_state(prev_state, alive, close):
     """State after a cancel: terminal states are kept (closing a finished block changes nothing);
     a live interactive worker that was only interrupted stays ready; otherwise cancelled."""
-    if prev_state in TERMINAL_STATES or prev_state.startswith("abandoned"):
-        return prev_state
+    live = prev_state in LIVE_STATES or str(prev_state).startswith(("blocked", "taken-over"))
+    if not live:
+        return prev_state  # finished, failed, reviewed or abandoned: nothing to cancel
     if alive and not close:
         return "ready"
     return "cancelled"
@@ -645,6 +711,9 @@ def do_cancel(rec, close):
 
 def cmd_cancel(a):
     rec = load_record(a.assignment_id)
+    caller = a.as_owner or os.environ.get("REX_BLOCK")
+    if owner_mismatch(rec, caller):
+        print(f"cancel refused: record owner is {rec.get('owner', {}).get('block_id')}, you are {caller}", file=sys.stderr); return EXIT_GUARD
     print(json.dumps({"assignment_id": rec["assignment_id"], "state": do_cancel(rec, a.close)})); return 0
 
 
@@ -715,7 +784,7 @@ def main(argv=None):
         sp.add_argument("--allow", action="append", help="claude --allowedTools entry (repeatable)")
         sp.add_argument("--worktree", action="store_true"); sp.add_argument("--label"); sp.add_argument("--osc-status", action="store_true")
         sp.add_argument("--assignment-id"); sp.add_argument("--prompt", help="override the one-line prompt (default points at brief.md)")
-        sp.add_argument("--as-owner", help="owner block id when running as an external controller"); sp.add_argument("--controller", default=os.environ.get("REX_ORCH_CONTROLLER", "unknown"))
+        sp.add_argument("--as-owner", help="block id to record as owner (outside controller claiming a pane, or a lead overriding whoami)"); sp.add_argument("--controller", default=os.environ.get("REX_ORCH_CONTROLLER", "unknown"))
         sp.add_argument("--external", action="store_true", help="outside controller: ignore any inherited REX_* pane identity")
         sp.add_argument("--deliverable", help="file the brief must produce, relative to the run dir (e.g. REPORT.md, review.json); wait downgrades completion when it is missing")
         sp.add_argument("--resume-of", help=argparse.SUPPRESS)
@@ -726,7 +795,7 @@ def main(argv=None):
     sp = sub.add_parser("send", help="guarded prompt delivery to an interactive worker"); sp.add_argument("assignment_id"); g = sp.add_mutually_exclusive_group(required=True); g.add_argument("--text"); g.add_argument("--brief"); sp.add_argument("--as-owner"); sp.set_defaults(fn=cmd_send)
     sp = sub.add_parser("watch", help="wait for fresh turn evidence"); sp.add_argument("assignment_id"); sp.add_argument("--for", dest="for_", default="20m"); sp.set_defaults(fn=cmd_watch)
     sp = sub.add_parser("notify", help="(hooks) append a turn marker"); sp.add_argument("assignment_id"); sp.add_argument("payload", nargs="?"); sp.add_argument("--ev"); sp.add_argument("--osc", action="store_true"); sp.set_defaults(fn=cmd_notify)
-    sp = sub.add_parser("cancel", help="interrupt, optionally close"); sp.add_argument("assignment_id"); sp.add_argument("--close", action="store_true"); sp.set_defaults(fn=cmd_cancel)
+    sp = sub.add_parser("cancel", help="interrupt, optionally close"); sp.add_argument("assignment_id"); sp.add_argument("--close", action="store_true"); sp.add_argument("--as-owner"); sp.set_defaults(fn=cmd_cancel)
     sp = sub.add_parser("resume", help="new block continuing a process-mode worker's session"); sp.add_argument("assignment_id"); launch_args(sp); sp.set_defaults(fn=cmd_resume)
     sp = sub.add_parser("review", help="record a reviewer's review.json verdict on an executor assignment"); sp.add_argument("assignment_id", help="executor assignment"); g = sp.add_mutually_exclusive_group(required=True); g.add_argument("--reviewer", help="reviewer assignment id (its run dir holds review.json)"); g.add_argument("--from-file", help="path to a review.json"); sp.set_defaults(fn=cmd_review)
     sp = sub.add_parser("list", help="list assignments"); sp.add_argument("--state"); sp.set_defaults(fn=cmd_list)

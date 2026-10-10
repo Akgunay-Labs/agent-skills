@@ -28,7 +28,7 @@ Marker sequence seen in one session: `session_start prompt stop prompt stop prom
 
 ## Send guards (all must pass, exit 6 names the failing one)
 
-`not-owner` (record's owner block ≠ your `REX_BLOCK` or `--as-owner`), `foreground-not-agent`, `blocked` (newest `blocked` marker newer than newest `stop`, or a Rex `blocked` record), `not-ready`. `send` then snapshots the screen hash, records `sent_at`, and does `rex send` + `send-key enter`. Prompts are one line pointing at a file. After an interrupt, check `capture` for leftover text in the input box before sending (**live**).
+`not-owner` (record's owner block ≠ your `REX_BLOCK` or `--as-owner`), `foreground-not-agent`, `blocked` (newest `blocked` marker newer than newest `stop`/`interrupted`, or a Rex `blocked` record), `dialog-open` (a permission or trust dialog is on the screen, Claude or Codex wording), `input-not-empty`, `not-ready`. A record that never reached `ready` (slow start, dialog answered later) is re-checked by `status` and by `send` itself, which set `ready_at` once the agent is in the foreground at its prompt. `send` then snapshots the screen hash, records `sent_at`, and does `rex send` + `send-key enter`. Prompts are one line pointing at a file. After an interrupt, check `capture` for leftover text in the input box before sending (**live**).
 
 ## Watch outcomes
 

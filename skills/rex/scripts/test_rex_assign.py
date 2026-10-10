@@ -188,9 +188,9 @@ class ModeB(unittest.TestCase):
         s = ra.interactive_claude_settings("a-1", pathlib.Path("/x/rex_assign.py"), osc=True)
         self.assertEqual(sorted(s["hooks"]), ["Notification", "SessionEnd", "SessionStart", "Stop", "UserPromptSubmit"])
         for ev, hooks in s["hooks"].items():
-            cmd = hooks[0]["hooks"][0]["command"]
-            self.assertIn("/x/rex_assign.py notify a-1", cmd)
-            self.assertIn("--osc", cmd)
+            parts = shlex.split(hooks[0]["hooks"][0]["command"])
+            self.assertIn("/x/rex_assign.py", parts); self.assertIn("notify", parts); self.assertIn("a-1", parts)
+            self.assertIn("--osc", parts)
         self.assertEqual(s["preferredNotifChannel"], "terminal_bell")
 
     def test_codex_notify_override_is_per_launch_argv(self):
@@ -305,6 +305,76 @@ class ModeB(unittest.TestCase):
 
     def test_readiness_timeout_is_failed_launch(self):
         self.assertEqual(ra.readiness({"foreground": {"name": "zsh"}}, [], "", 31, "claude"), "failed:launch")
+
+
+class FixPass(unittest.TestCase):
+    # Important 2 + minors: cancel keeps every non-live state
+    def test_cancel_keeps_review_verdicts_and_other_final_states(self):
+        for st in ("accepted", "changes-requested", "completed-without-deliverable", "failed:launch", "exited-without-result"):
+            self.assertEqual(ra.cancel_state(st, alive=False, close=True), st)
+        for st in ("blocked:permission_prompt", "taken-over:person", "timeout", "ready", "launched", "working"):
+            self.assertEqual(ra.cancel_state(st, alive=False, close=True), "cancelled")
+
+    # Important 3: rex wait outcomes are classified before worker classification
+    def test_parse_wait_distinguishes_rex_outcomes(self):
+        self.assertEqual(ra.parse_wait(0, '{"exit_code":0}\n'), ("exit", 0))
+        self.assertEqual(ra.parse_wait(1, '{"exit_code":1,"error":"exit status 1"}\n'), ("exit", 1))
+        self.assertEqual(ra.parse_wait(1, ""), ("timeout", None))
+        self.assertEqual(ra.parse_wait(3, ""), ("not-found", None))
+        self.assertEqual(ra.parse_wait(4, ""), ("server-unreachable", None))
+        self.assertEqual(ra.parse_wait(130, ""), ("interrupted", None))
+
+    # Important 5: policy actually reaches the agent
+    def test_codex_commands_carry_sandbox_mode(self):
+        p = ra.build_worker_command("codex", "process", ra.Policy("read-only", []), RUN, None)
+        self.assertIn("read-only", shlex.split(p.split(" > ")[0]))
+        self.assertIn("-s", shlex.split(p.split(" > ")[0]))
+        q = ra.build_worker_command("codex", "interactive", ra.Policy("read-only", []), RUN, None, assignment_id="a-1")
+        self.assertIn("read-only", shlex.split(q))
+
+    def test_interactive_claude_carries_allowed_tools(self):
+        p = ra.build_worker_command("claude", "interactive", ra.Policy("default", ["Read", "Bash(git *)"]), RUN, "u-2")
+        parts = shlex.split(p)
+        self.assertIn("--allowedTools", parts)
+        self.assertIn("Bash(git *)", parts)
+
+    # Important 6: generated hook/notify commands carry the runs root
+    def test_hook_and_notify_commands_carry_runs_root(self):
+        v = json.loads(ra.codex_notify_override("a-1", pathlib.Path("/x/h.py"), runs_root=pathlib.Path("/r"))[len("notify="):])
+        self.assertIn("--runs-root", v); self.assertIn("/r", v)
+        cmd = ra.interactive_claude_settings("a-1", pathlib.Path("/x/h.py"), runs_root=pathlib.Path("/r"))["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertIn("--runs-root", shlex.split(cmd)); self.assertIn("/r", shlex.split(cmd))
+
+    # Important 7: a dialog on screen is its own guard
+    def test_send_guard_dialog_open(self):
+        cap = "  Allow command?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
+        g = ra.send_guards({"owner": {"block_id": B}, "ready_at": "x"}, {"foreground": {"name": "codex"}}, [], caller_block=B, capture=cap)
+        self.assertIn("dialog-open", g)
+        self.assertTrue(ra.dialog_open("Would you like to run this command?\n› 1. Yes"))
+        self.assertFalse(ra.dialog_open("⏺ OK\n❯ \n  ⏸ manual mode on"))
+
+    # Important 4: readiness can be recovered later
+    def test_ready_recovery_sets_ready_at(self):
+        rec = {"state": "failed:launch", "worker": {"agent": "claude"}}
+        out = ra.recover_ready(rec, {"foreground": {"name": "claude"}}, [{"ev": "session_start"}], "❯ ")
+        self.assertTrue(out["ready_at"]); self.assertEqual(out["state"], "ready")
+        rec = {"state": "failed:launch", "worker": {"agent": "claude"}}
+        out = ra.recover_ready(rec, {"foreground": {"name": "zsh"}}, [], "")
+        self.assertNotIn("ready_at", out)
+
+    # promoted minors
+    def test_apply_review_requires_a_completed_run_with_deliverable(self):
+        with self.assertRaises(ValueError):
+            ra.apply_review({"state": "completed-without-deliverable"}, {"verdict": "accepted"}, "r")
+
+    def test_wait_state_update_skips_reviewed_records(self):
+        self.assertEqual(ra.next_wait_state({"state": "accepted", "review": {"verdict": "accepted"}}, "completed-unreviewed"), "accepted")
+        self.assertEqual(ra.next_wait_state({"state": "launched", "review": None}, "completed-unreviewed"), "completed-unreviewed")
+
+    def test_cancel_owner_guard(self):
+        self.assertEqual(ra.owner_mismatch({"owner": {"block_id": "block:a"}}, "block:b"), True)
+        self.assertEqual(ra.owner_mismatch({"owner": {"block_id": "block:a"}}, "block:a"), False)
+        self.assertEqual(ra.owner_mismatch({"owner": {"block_id": None}}, None), False)
 
 
 class CliGuards(unittest.TestCase):

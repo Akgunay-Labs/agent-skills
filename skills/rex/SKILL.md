@@ -29,7 +29,7 @@ Full recipes and the exit-code table: `references/targets-and-entry-paths.md`.
 | Done | child exit via `rex wait`, then the result file | fresh turn marker written by the agent's own hook, then the result file |
 | Approvals | fixed at launch (`--permission-mode`, `--allowedTools`); denials appear in the result | a `blocked` marker; a person answers, never you |
 
-Default to Mode A; resume it with `resume`, follow up in B with `send`. Details: `references/assignment-lifecycle.md`, `references/interactive-workers.md`.
+Default to Mode A; `resume` continues it, `send` follows up in B. Details: `references/assignment-lifecycle.md`, `references/interactive-workers.md`.
 
 ## 3. Assignment flow
 
@@ -38,7 +38,7 @@ Default to Mode A; resume it with `resume`, follow up in B with `send`. Details:
 3. Mode A: `wait <id> --for 30m`. Mode B: `send <id> --text '…'` then `watch <id> --for 20m`. `send` refuses (exit 6) and names the guard: not owner, agent not in the foreground, dialog open, or text left in the input box.
 4. Read `result.json` (or `events.jsonl` + `last-message.md`) and `REPORT.md`. The state is `completed-unreviewed` at best: the worker's deliverable exists and it says it finished. For a standalone reviewer or research task, that plus the deliverable file is the end.
 5. Executor work gets a review: launch a second assignment with `--role reviewer --permission acceptEdits --deliverable review.json` (plan mode cannot write the file) and a brief that forbids touching the repo and asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Then `review <executor-id> --reviewer <reviewer-id>` records the verdict; nothing else moves an executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
-6. Finish: `cancel <id> --close` closes the block; `list` shows everything you own.
+6. Finish: `cancel <id> --close` (owner only); `list` shows every record under the runs root, not only yours.
 
 PR work runs with `--worktree` (agent-managed), never a shell-created worktree.
 
