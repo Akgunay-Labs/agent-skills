@@ -24,7 +24,7 @@ Marker sequence seen in one session: `session_start prompt stop prompt stop prom
 
 ## Launch and readiness
 
-`launch --mode interactive --agent claude|codex …` runs `exec claude --model M --permission-mode P --settings RUN/claude-settings.json --session-id UUID --name AID` (or `exec codex --no-daemon -c notify=… -c shell_environment_policy.inherit=all`). Readiness: `process.foreground.name` is the agent, then a `session_start` marker or, after 20 s, the input prompt visible in `capture`; still a shell after 30 s → `failed:launch` with the screen tail recorded (**live**: a prompt appeared ~55 s after launch once under load, so a `failed:launch` can be a slow start; `status` shows the truth).
+`launch --mode interactive --agent claude|codex …` runs `exec claude --model M --permission-mode P --settings RUN/claude-settings.json --session-id UUID --name AID` (or `exec codex --no-daemon -c notify=… -c shell_environment_policy.inherit=all`). Readiness: `process.foreground.name` is the agent, then a `session_start` marker or, after 20 s, the input prompt visible in `capture`; a trust-this-folder or permission dialog on screen → `blocked:startup-dialog` (hooks do not run behind it; a person must answer; **live**: a fresh git directory triggers it, print mode does not); still a shell after 30 s → `failed:launch` with the screen tail recorded (**live**: a prompt appeared ~55 s after launch once under load, so a `failed:launch` can be a slow start; `status` shows the truth).
 
 ## Send guards (all must pass, exit 6 names the failing one)
 
@@ -46,6 +46,10 @@ No turn end is task completion. Completion still needs the artifact the brief as
 ## Cancel vs interrupt
 
 `cancel <id>` sends Ctrl+C: for an interactive worker that interrupts the turn and leaves the agent running (`state: ready`, `interrupted_at` set). `cancel --close` closes the block and ends the worker. Exit cleanly instead with `send --text /exit` (Claude) or `/quit` (Codex) and let `child_exited` arrive.
+
+## Shared panes
+
+The worker's pane is visible in the Rex app, and the person at the keyboard can answer a dialog, type, or close the block at any time (**live**: both happened during testing). A `blocked` outcome that clears without a marker, or a block that is suddenly `not found`, usually means a person acted. Say so in the report instead of guessing.
 
 ## Open items
 
