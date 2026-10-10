@@ -58,8 +58,17 @@ def interactive_claude_settings(assignment_id, helper=HELPER, osc=False):
                       "Notification": hook("blocked"), "Stop": hook("stop"), "SessionEnd": hook("end")}}
 
 
+def stage_helper(run_dir):
+    """Copy this script into the run dir. Hooks and Codex notify run inside sandboxes that may not read
+    the skill's real location (e.g. a TCC-protected ~/Documents); the run dir under ~/.local/state is safe."""
+    import shutil
+    dst = pathlib.Path(run_dir) / "rex_assign.py"
+    shutil.copyfile(HELPER, dst)
+    return dst
+
+
 def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=None, effort=None,
-                         worktree=False, cwd=None, assignment_id=None, resume_of=None, prompt=None):
+                         worktree=False, cwd=None, assignment_id=None, resume_of=None, prompt=None, helper=None):
     """Return the `sh -c` payload. Starts with exec so the agent is the block's foreground process."""
     run_dir = pathlib.Path(run_dir)
     aid = assignment_id or run_dir.name
@@ -92,7 +101,7 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
             if resume_of:
                 parts += ["resume", resume_of]
             parts += ["--approve-for-me", "-c", "shell_environment_policy.inherit=all", "--skip-git-repo-check",
-                      "--json", "-o", str(run_dir / "last-message.md")]
+                      "--json", "-o", str(run_dir / "last-message.md"), "--add-dir", str(run_dir)]
             if model:
                 parts += ["-m", model]
             if cwd:
@@ -101,7 +110,7 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
                 parts += ["--worktree"]
             parts += [prompt]
             return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "events.jsonl"))
-        parts = ["exec", "codex", "--no-daemon", "-c", codex_notify_override(aid), "-c", "shell_environment_policy.inherit=all"]
+        parts = ["exec", "codex", "--no-daemon", "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all"]
         if model:
             parts += ["-m", model]
         return " ".join(q(p) for p in parts)
@@ -143,8 +152,10 @@ def classify(exit_code, result_path, agent):
     lines = [l for l in result_path.read_text().splitlines() if l.strip()]
     types = [json.loads(l).get("type") for l in lines if l.startswith("{")]
     last = result_path.with_name("last-message.md")
-    if "turn.completed" in types and last.exists():
+    if "turn.completed" in types and last.exists() and last.read_text().strip():
         return "completed-unreviewed", last.read_text()[:200]
+    if "turn.completed" in types:
+        return "exited-without-result", "turn completed but last-message.md is empty (no deliverable reported)"
     return "exited-without-result", "no turn.completed in events.jsonl"
 
 
@@ -331,10 +342,11 @@ def cmd_launch(a):
     (run_dir / "brief.md").write_text(render_brief(brief_text, run_dir))
     policy = Policy(a.permission or ("acceptEdits" if a.agent == "claude" else "workspace-write"), a.allow or [])
     agent_session_id = str(uuid.uuid4()) if a.agent == "claude" else None
+    helper = stage_helper(run_dir) if a.mode == "interactive" else HELPER
     if a.mode == "interactive" and a.agent == "claude":
-        (run_dir / "claude-settings.json").write_text(json.dumps(interactive_claude_settings(aid, HELPER, osc=a.osc_status), indent=2))
+        (run_dir / "claude-settings.json").write_text(json.dumps(interactive_claude_settings(aid, helper, osc=a.osc_status), indent=2))
     payload = build_worker_command(a.agent, a.mode, policy, run_dir, agent_session_id, model=a.model, effort=a.effort,
-                                   worktree=a.worktree, cwd=a.cwd, assignment_id=aid, resume_of=a.resume_of, prompt=a.prompt)
+                                   worktree=a.worktree, cwd=a.cwd, assignment_id=aid, resume_of=a.resume_of, prompt=a.prompt, helper=helper)
     argv = build_rex_create_argv(a.session, a.anchor, a.split, a.new_window, a.label or aid, a.cwd, payload, rex=rex_bin())
     (run_dir / "launching").write_text(now_iso() + "\n" + " ".join(shlex.quote(x) for x in argv) + "\n")
     r = RUN(argv, capture_output=True, text=True)

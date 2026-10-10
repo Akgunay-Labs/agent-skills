@@ -97,6 +97,32 @@ class Classification(unittest.TestCase):
             p = self.write(d, "events.jsonl", '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed"}\n')
             self.assertEqual(ra.classify(0, p, "codex")[0], "completed-unreviewed")
 
+    def test_classify_codex_empty_last_message_is_no_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write(d, "last-message.md", "")
+            p = self.write(d, "events.jsonl", '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed"}\n')
+            self.assertEqual(ra.classify(0, p, "codex")[0], "exited-without-result")
+
+    def test_codex_process_command_adds_run_dir_to_sandbox(self):
+        p = ra.build_worker_command("codex", "process", ra.Policy("workspace-write", []), RUN, None)
+        parts = shlex.split(p.split(" > ")[0])
+        self.assertIn("--add-dir", parts)
+        self.assertIn(str(RUN), parts)
+
+    def test_interactive_commands_use_staged_helper_path(self):
+        p = ra.build_worker_command("codex", "interactive", ra.Policy("default", []), RUN, None, assignment_id="a-1", helper=RUN / "rex_assign.py")
+        self.assertIn(str(RUN / "rex_assign.py"), p)
+        self.assertNotIn(str(ra.HELPER), p)
+        s = ra.interactive_claude_settings("a-1", RUN / "rex_assign.py")
+        self.assertIn(str(RUN / "rex_assign.py"), s["hooks"]["Stop"][0]["hooks"][0]["command"])
+
+    def test_stage_helper_copies_script_into_run_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            staged = ra.stage_helper(pathlib.Path(d))
+            self.assertEqual(staged, pathlib.Path(d) / "rex_assign.py")
+            self.assertTrue(staged.exists())
+            self.assertIn("def stage_helper", staged.read_text())
+
     def test_server_restart_detected(self):
         self.assertEqual(ra.check_server({"instance_id": "a"}, {"instance_id": "b"}), "abandoned:server-restarted")
         self.assertIsNone(ra.check_server({"instance_id": "a"}, {"instance_id": "a"}))
