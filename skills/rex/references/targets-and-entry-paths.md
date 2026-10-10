@@ -63,3 +63,19 @@ Codex's `shell_environment_policy.inherit = "core"` strips `REX_*` from the comm
 ## Multiple sessions, labels, suffixes
 
 `rex ls --json` lists sessions. Labels are convenient at a prompt but can change and repeat; suffixes are 6 chars by default and can collide. Resolve a label to a full ID once (`jq -r '.sessions[] | select(.label=="x") | .session_id'`) and use the ID from then on. The helper refuses `--session` values that are not full IDs for this reason.
+
+## Raw command forms (live)
+
+```sh
+rex split -s S -b B --split right --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec claude …'
+rex run   -s S --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec codex …'   # new window
+rex wait  -s S --for 30m --json BLOCK      # exit = child's exit; timeout prints no JSON and exits 1
+rex capture -s S -b BLOCK --trim           # current screen only, not a transcript
+rex block call process -s S -b BLOCK ; rex block call program_status -s S -b BLOCK
+rex send -s S -b BLOCK 'one line' ; rex send-key -s S -b BLOCK enter      # also: ctrl+c, escape
+rex events -s S --json                     # NDJSON stream; give it an owner and kill it
+rex block close -s S BLOCK
+```
+
+Always `exec` the agent inside `sh -c` so `process.foreground.name` is the agent, not `bash` (readiness and Rex's heuristic status both key on it). The command after `--` is not shell-parsed; `sh -c` gives you redirects and `&&`.
+

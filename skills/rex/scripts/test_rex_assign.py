@@ -117,6 +117,13 @@ class Classification(unittest.TestCase):
         self.assertEqual(ra.resolve_owner(None, {"block_id": "block:mine"}), ("lead-in-rex", "block:mine"))
         self.assertEqual(ra.resolve_owner(None, {"block_id": None}), ("external", None))
 
+    def test_external_flag_ignores_whoami_block(self):
+        self.assertEqual(ra.resolve_owner(None, {"block_id": "block:mine"}, external=True), ("external", None))
+        self.assertEqual(ra.resolve_owner("block:x", {"block_id": "block:mine"}, external=True), ("external", "block:x"))
+
+    def test_brief_run_dir_substitution(self):
+        self.assertEqual(ra.render_brief("Write REPORT.md in $RUN_DIR now. ${RUN_DIR}/x", pathlib.Path("/r/a-1")), "Write REPORT.md in /r/a-1 now. /r/a-1/x")
+
     def test_states_never_say_accepted_without_review(self):
         for st in ra.TERMINAL_STATES:
             self.assertNotEqual(st, "accepted")
@@ -192,6 +199,24 @@ class ModeB(unittest.TestCase):
     def test_watch_interrupt_marker_is_not_turn_end(self):
         turns = [{"ev": "prompt", "ts": "2026-10-10T00:05:00Z"}, {"ev": "interrupted", "ts": "2026-10-10T00:05:30Z"}]
         self.assertEqual(ra.watch_outcome(turns, [], sent_at="2026-10-10T00:04:00Z")[0], "no-fresh-evidence")
+
+    def test_watch_interrupt_clears_older_blocked(self):
+        turns = [{"ev": "blocked", "ts": "2026-10-10T00:05:00Z", "notification_type": "permission_prompt"}, {"ev": "interrupted", "ts": "2026-10-10T00:06:00Z"}]
+        self.assertEqual(ra.watch_outcome(turns, [], sent_at="2026-10-10T00:04:00Z")[0], "no-fresh-evidence")
+
+    def test_send_guard_blocked_cleared_by_interrupt(self):
+        turns = [{"ev": "blocked", "ts": "2026-10-10T00:05:00Z"}, {"ev": "interrupted", "ts": "2026-10-10T00:06:00Z"}]
+        self.assertNotIn("blocked", ra.send_guards(self.rec(), {"foreground": {"name": "claude"}}, turns, caller_block=B))
+
+    def test_input_box_text_detected(self):
+        self.assertTrue(ra.input_has_text("⏺ OK\n──── w ─\n❯ Use the Bash tool to run exactly: ls /tmp\n────\n  ⏸ manual mode on"))
+        self.assertFalse(ra.input_has_text("⏺ OK\n──── w ─\n❯ \n────\n  ⏸ manual mode on"))
+        self.assertFalse(ra.input_has_text("› Ask Codex to do anything\n  GPT-6 xhigh"))
+        self.assertTrue(ra.input_has_text("› leftover text here\n  GPT-6 xhigh"))
+
+    def test_send_guard_input_not_empty(self):
+        g = ra.send_guards(self.rec(), {"foreground": {"name": "claude"}}, [], caller_block=B, capture="❯ leftover\n  ⏸ manual mode on")
+        self.assertIn("input-not-empty", g)
 
     def test_readiness_requires_agent_foreground_then_marker_or_prompt(self):
         self.assertEqual(ra.readiness({"foreground": {"name": "zsh"}}, [], "", 5, "claude"), "starting")

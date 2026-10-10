@@ -148,11 +148,35 @@ def classify(exit_code, result_path, agent):
     return "exited-without-result", "no turn.completed in events.jsonl"
 
 
-def resolve_owner(as_owner, whoami):
-    """(kind, block_id): an explicit --as-owner always wins; otherwise the caller's own pane from whoami."""
+def resolve_owner(as_owner, whoami, external=False):
+    """(kind, block_id): an explicit --as-owner always wins; --external ignores any inherited pane;
+    otherwise the caller's own pane from whoami."""
     if as_owner:
         return "external", as_owner
-    return ("lead-in-rex", whoami.get("block_id")) if whoami.get("block_id") else ("external", None)
+    if external or not whoami.get("block_id"):
+        return "external", None
+    return "lead-in-rex", whoami.get("block_id")
+
+
+def render_brief(text, run_dir):
+    """Substitute $RUN_DIR / ${RUN_DIR} so a brief can name its own run directory before it exists."""
+    return text.replace("${RUN_DIR}", str(run_dir)).replace("$RUN_DIR", str(run_dir))
+
+
+INPUT_PLACEHOLDERS = ("Ask Codex to do anything", "Try \"")  # empty-input hints the TUIs render
+
+
+def input_has_text(capture):
+    """True when the agent's input box (last line starting with the prompt glyph) holds real text."""
+    last = None
+    for line in capture.splitlines():
+        st = line.strip()
+        if st.startswith(("❯", "›")):
+            last = st
+    if not last:
+        return False
+    body = last[1:].strip()
+    return bool(body) and not body.startswith(INPUT_PLACEHOLDERS)
 
 
 def check_server(stored_server, whoami):
@@ -168,17 +192,24 @@ def _latest(turns, ev):
     return max(ts) if ts else ""
 
 
-def send_guards(record, process, turns, caller_block):
+def _blocked_open(turns):
+    """A blocked marker is open until a newer stop or interrupted marker."""
+    return _latest(turns, "blocked") > max(_latest(turns, "stop"), _latest(turns, "interrupted"))
+
+
+def send_guards(record, process, turns, caller_block, capture=None):
     failing = []
     if record.get("owner", {}).get("block_id") != caller_block:
         failing.append("not-owner")
     fg = (process.get("foreground") or {}).get("name")
     if fg not in AGENTS:
         failing.append("foreground-not-agent")
-    if _latest(turns, "blocked") > _latest(turns, "stop"):
+    if _blocked_open(turns):
         failing.append("blocked")
     if not record.get("ready_at"):
         failing.append("not-ready")
+    if capture is not None and input_has_text(capture):
+        failing.append("input-not-empty")
     return failing
 
 
@@ -186,9 +217,9 @@ def watch_outcome(turns, events, sent_at):
     fresh_t = [t for t in turns if t.get("ts", "") > sent_at]
     fresh_e = [e for e in events if e.get("ts", "") > sent_at]
     evidence = [f"turn:{t.get('ev')}@{t.get('ts')}" for t in fresh_t] + [f"event:{e.get('name')}@{e.get('ts')}" for e in fresh_e]
-    for t in fresh_t:
-        if t.get("ev") == "blocked":
-            return f"blocked:{t.get('notification_type') or 'unknown'}", evidence
+    if _blocked_open(fresh_t):
+        t = [x for x in fresh_t if x.get("ev") == "blocked"][-1]
+        return f"blocked:{t.get('notification_type') or 'unknown'}", evidence
     if any(e.get("name") == "child_exited" for e in fresh_e):
         return "exited", evidence
     if any(t.get("ev") == "stop" for t in fresh_t):
@@ -292,7 +323,7 @@ def cmd_launch(a):
         return EXIT_SERVER
     run_dir.mkdir(parents=True, exist_ok=True)
     brief_text = pathlib.Path(a.brief).read_text() if a.brief != "-" else sys.stdin.read()
-    (run_dir / "brief.md").write_text(brief_text)
+    (run_dir / "brief.md").write_text(render_brief(brief_text, run_dir))
     policy = Policy(a.permission or ("acceptEdits" if a.agent == "claude" else "workspace-write"), a.allow or [])
     agent_session_id = str(uuid.uuid4()) if a.agent == "claude" else None
     if a.mode == "interactive" and a.agent == "claude":
@@ -308,7 +339,7 @@ def cmd_launch(a):
     created = json.loads(r.stdout)
     block_id = created["block_ids"][0]
     rec = {"assignment_id": aid, "role": a.role,
-           "owner": dict(zip(("kind", "block_id"), resolve_owner(a.as_owner, who)), controller=a.controller),
+           "owner": dict(zip(("kind", "block_id"), resolve_owner(a.as_owner, who, external=a.external)), controller=a.controller),
            "server": {"endpoint": who.get("endpoint"), "instance_id": who.get("instance_id"), "host_id": who.get("host_id")},
            "target": {"session_id": a.session, "window_id": created.get("window_id"), "block_id": block_id, "label": a.label or aid},
            "worker": {"agent": a.agent, "mode": a.mode, "model": a.model, "effort": a.effort,
@@ -406,11 +437,12 @@ def cmd_send(a):
     _, st = block_call(sid, b, "program_status")
     if any(r.get("state") == "blocked" for r in st.get("records", [])):
         turns = turns + [{"ev": "blocked", "ts": "9999", "notification_type": "rex-status"}]
-    failing = send_guards(rec, proc, turns, caller)
-    if failing:
-        print("send refused; failing guards: " + ", ".join(failing), file=sys.stderr); return EXIT_GUARD
-    text = a.text if a.text is not None else f"Read {a.brief} and do exactly what it says."
     _, _, cap, _ = rex("capture", "-s", sid, "-b", b, "--trim", json_out=False)
+    failing = send_guards(rec, proc, turns, caller, capture=cap)
+    if failing:
+        hint = " (input box holds text: clear it first, e.g. rex send-key -s S -b B ctrl+u, or wait for the person)" if "input-not-empty" in failing else ""
+        print("send refused; failing guards: " + ", ".join(failing) + hint, file=sys.stderr); return EXIT_GUARD
+    text = a.text if a.text is not None else f"Read {a.brief} and do exactly what it says."
     sent = {"seq": len(rec.get("sends", [])) + 1, "sent_at": now_iso(), "capture_sha": hashlib.sha1(cap.encode()).hexdigest()[:12], "text": text[:200]}
     rc1, _, _, e1 = rex("send", "-s", sid, "-b", b, text, json_out=False)
     rc2, _, _, e2 = rex("send-key", "-s", sid, "-b", b, "enter", json_out=False)
@@ -509,6 +541,8 @@ def do_cancel(rec, close):
         rec["state"] = "abandoned:block-closed"; save_record(rec); return rec["state"]
     if (proc.get("foreground") or {}).get("name") in AGENTS:
         rex("send-key", "-s", sid, "-b", b, "ctrl+c", json_out=False)
+        with (pathlib.Path(rec["paths"]["run_dir"]) / "turns.jsonl").open("a") as f:
+            f.write(json.dumps({"ev": "interrupted", "ts": now_iso(), "by": "rex_assign cancel"}) + "\n")
         rex("wait", "-s", sid, "--for", "15s", b, json_out=False)
     rc, proc = block_call(sid, b, "process")
     alive = rc == 0 and (proc.get("foreground") or {}).get("name") in AGENTS and not proc.get("last_exit")
@@ -540,7 +574,7 @@ def cmd_resume(a):
     ns.cwd = a.cwd or w.get("cwd"); ns.model = a.model or w.get("model"); ns.effort = a.effort or w.get("effort")
     ns.permission = a.permission or w["permission_policy"]["mode"]; ns.allow = a.allow or w["permission_policy"].get("allowed_tools")
     ns.worktree = False; ns.label = None; ns.assignment_id = None; ns.prompt = None; ns.osc_status = False
-    ns.as_owner = old["owner"].get("block_id"); ns.controller = old["owner"].get("controller")
+    ns.as_owner = old["owner"].get("block_id"); ns.controller = old["owner"].get("controller"); ns.external = old["owner"].get("kind") == "external"
     return cmd_launch(ns)
 
 
@@ -593,6 +627,7 @@ def main(argv=None):
         sp.add_argument("--worktree", action="store_true"); sp.add_argument("--label"); sp.add_argument("--osc-status", action="store_true")
         sp.add_argument("--assignment-id"); sp.add_argument("--prompt", help="override the one-line prompt (default points at brief.md)")
         sp.add_argument("--as-owner", help="owner block id when running as an external controller"); sp.add_argument("--controller", default=os.environ.get("REX_ORCH_CONTROLLER", "unknown"))
+        sp.add_argument("--external", action="store_true", help="outside controller: ignore any inherited REX_* pane identity")
         sp.add_argument("--resume-of", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("launch", help="create a block and start a worker"); launch_args(sp); sp.set_defaults(fn=cmd_launch)

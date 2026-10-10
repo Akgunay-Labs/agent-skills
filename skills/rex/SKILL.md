@@ -12,7 +12,7 @@ Helper for everything below: `python3 -I <this skill>/scripts/rex_assign.py <sub
 ## 1. Bind the target before anything else
 
 - **Inside a Rex pane:** `rex whoami --json` gives your `session_id`, `window_id`, `block_id`, `instance_id`. Store them. Still pass `-s SESSION` and `-b BLOCK` on every command that creates, types, or closes; defaults resolve to the focused block, which is not necessarily yours.
-- **Outside Rex** (Codex Desktop, a plain shell, a daemon): no `REX_*` variables exist. Use `"$REX_BIN_DIR/rex"` or `/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex`. Choose the session from `rex ls --json` by the full ID the user named. More than one session and none named: stop and ask, or create your own with `rex new LABEL --cwd DIR --json`. Never pick the first or the most recent.
+- **Outside Rex** (Codex Desktop, a plain shell, a daemon): you have no pane. Any `REX_*` you inherited belongs to whatever launched you: `unset REX_SESSION REX_BLOCK` and pass `--external` to the helper. Find `rex` via `"$REX_BIN_DIR/rex"` if set, else `/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex`. Choose the session from `rex ls --json` by the full ID the user named. More than one session and none named: stop and ask, or create your own with `rex new LABEL --cwd DIR --json` and record its `session_id` and initial block as yours. Never pick the first or the most recent.
 - **Codex inside a Rex pane** loses `REX_*` in the commands it runs. Launch it as `codex --no-daemon -c shell_environment_policy.inherit=all` (interactive) or `codex exec --approve-for-me -c shell_environment_policy.inherit=all` (headless), per launch, never by editing its config.
 - **IDs only.** Store and script full IDs (`session:…`, `block:…`), never labels or short suffixes: labels change and suffixes collide. Exit 3 means not found or ambiguous and nothing changed; exit 4 means the server is unreachable.
 - **Server identity.** Keep `instance_id`. A different value later means Rex restarted and every stored ID is stale: re-bind, do not retry.
@@ -34,11 +34,11 @@ Default to Mode A. Details: `references/assignment-lifecycle.md` (A), `reference
 
 ## 3. Assignment flow
 
-1. Write the brief to a file. End it with: "Write `REPORT.md` in `$RUN_DIR` with what changed, how you verified, what you did not do."
+1. Write the brief to a file. End it with: "Write `REPORT.md` in `$RUN_DIR` with what changed, how you verified, what you did not do." The helper replaces `$RUN_DIR` with the real run directory at launch.
 2. `rex_assign.py launch --agent claude|codex --session S (--anchor B [--split right] | --new-window) --cwd DIR --brief FILE [--model M] [--permission P] [--allow TOOL …] [--worktree] [--mode interactive]`. It writes a marker, creates the block, records `assignment.json` under `~/.local/state/rex-orch/runs/<id>/`, and prints the record. Every created block is in a record; nothing is created by hand.
-3. Mode A: `wait <id> --for 30m`. Mode B: `send <id> --text '…'` then `watch <id> --for 20m`.
-4. Read `result.json` (or `events.jsonl` + `last-message.md`) and `REPORT.md`. The state is `completed-unreviewed` at best.
-5. Review: launch a second assignment with `--role reviewer` and a read-only policy whose brief asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Only that file moves the executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
+3. Mode A: `wait <id> --for 30m`. Mode B: `send <id> --text '…'` then `watch <id> --for 20m`. `send` refuses (exit 6) and names the guard when you are not the owner, the agent is not in the foreground, a dialog is open, or text is left in the input box.
+4. Read `result.json` (or `events.jsonl` + `last-message.md`) and `REPORT.md`. The state is `completed-unreviewed` at best: the worker's deliverable exists and it says it finished. For a standalone reviewer or research task, that plus the deliverable file is the end.
+5. Executor work gets a review: launch a second assignment with `--role reviewer` and a read-only policy whose brief asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Only that file moves the executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
 6. Finish: `cancel <id> --close` closes the block and keeps a terminal state; `list` shows everything you own.
 
 PR-producing work runs with `--worktree` (agent-managed), never a shell-created worktree.
@@ -63,24 +63,13 @@ PR-producing work runs with `--worktree` (agent-managed), never a shell-created 
 - Never answer a permission dialog for the worker (`send-key enter` on "Do you want to proceed?"). Report `blocked:<type>` and the dialog text; a person decides.
 - Never call a quiet screen, `idle`, or a successful `send` "done". Done needs exit plus artifact (A) or a fresh marker plus artifact (B).
 - Never read other agents' transcripts under `~/.claude` or `~/.codex` to learn what happened. Records, result files and `capture` are the evidence.
-- Never leave a block or session you created unrecorded. Record first, then close or hand over, and say which.
-- Never run `rex kill`, `rex server`, `rex config`, `rex hosts`, `rex home` from this skill, and never edit `~/.codex/config.toml` or `~/.claude/settings.json` for a worker; per-launch flags only.
+- Never leave a block or session you created unrecorded. Record first, then close or hand over, and say which. Close only what you created: `block close` for your blocks, `session kill` only for a session you created and recorded.
+- Never run `rex server`, `rex config`, `rex hosts`, `rex home` from this skill, and never edit `~/.codex/config.toml` or `~/.claude/settings.json` for a worker; per-launch flags only.
 - Never replace `rex wait`/`watch` with a sleep loop.
 
-## 6. Raw commands when the helper does not fit
+## 6. Raw commands
 
-```sh
-rex split -s S -b B --split right --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec claude …'
-rex run   -s S --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec codex …'   # new window
-rex wait  -s S --for 30m --json BLOCK      # exit = child's exit; timeout prints no JSON and exits 1
-rex capture -s S -b BLOCK --trim           # current screen only, not a transcript
-rex block call process -s S -b BLOCK ; rex block call program_status -s S -b BLOCK
-rex send -s S -b BLOCK 'one line' ; rex send-key -s S -b BLOCK enter      # also: ctrl+c, escape
-rex events -s S --json                     # NDJSON stream; give it an owner and kill it
-rex block close -s S BLOCK
-```
-
-Always `exec` the agent inside `sh -c` so the foreground process is the agent, not `bash`. The command after `--` is not shell-parsed; `sh -c` gives you redirects.
+When the helper does not fit, the exact `split`/`run`/`wait`/`capture`/`send`/`events`/`close` forms are in `references/targets-and-entry-paths.md` ("Raw command forms"). Always `exec` the agent inside `sh -c` so the foreground process is the agent; the command after `--` is not shell-parsed.
 
 ## 7. Discovery
 
