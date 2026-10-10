@@ -5,9 +5,9 @@ description: Use when a lead agent must create Rex terminal blocks, launch or re
 
 # Rex orchestration
 
-Rex is a terminal multiplexer: sessions hold windows (tabs), windows hold blocks (terminals); the `rex` CLI drives them. Tested against Rex `0.0.1791564903-g7abb0a`, Claude Code 2.1.296, Codex 0.162.1 on 2026-10-10. A newer `rex version` is fine until a command here fails; then check `rex help <cmd>` before working around it.
+Rex is a terminal multiplexer: sessions hold windows (tabs), windows hold blocks (terminals); the `rex` CLI drives them. Tested against Rex `0.0.1791564903-g7abb0a`, Claude Code 2.1.296, Codex 0.162.1 on 2026-10-10. A newer `rex version` is fine until a command fails; then check `rex help <cmd>` first.
 
-Helper: `python3 -I <this skill>/scripts/rex_assign.py <subcommand> --help`.
+Helper: `python3 -I <skill>/scripts/rex_assign.py <subcommand> --help`.
 
 ## 1. Bind the target before anything else
 
