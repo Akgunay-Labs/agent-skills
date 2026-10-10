@@ -11,7 +11,7 @@ Helper: `python3 -I <this skill>/scripts/rex_assign.py <subcommand> --help`.
 
 ## 1. Bind the target before anything else
 
-- **Inside a Rex pane:** `rex whoami --json` gives your `session_id`, `window_id`, `block_id`, `instance_id`. Store them, and still pass `-s SESSION` and `-b BLOCK` on every command that creates, types, or closes; defaults resolve to the focused block, not necessarily yours.
+- **Inside a Rex pane:** `rex whoami --json` gives your `session_id`, `window_id`, `block_id`, `instance_id`. Store them; still pass `-s SESSION` and `-b BLOCK` on every command that creates, types, or closes; defaults resolve to the focused block, not necessarily yours.
 - **Outside Rex** (Codex Desktop, a plain shell, a daemon): you have no pane. Any `REX_*` you inherited belongs to whatever launched you: `unset REX_SESSION REX_BLOCK` and pass `--external` to the helper. Find `rex` via `"$REX_BIN_DIR/rex"` if set, else `/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex`. Choose the session from `rex ls --json` by the full ID the user named. More than one session and none named: stop and ask, or create your own with `rex new LABEL --cwd DIR --json` and record its `session_id` and initial block as yours. Never pick the first or the most recent.
 - **Codex inside a Rex pane** loses `REX_*` in the commands it runs. Launch it with `-c shell_environment_policy.inherit=all` (`codex --no-daemon …` interactive, `codex exec --approve-for-me …` headless), per launch, never by editing its config.
 - **IDs only.** Store and script full IDs (`session:…`, `block:…`), never labels or suffixes. Exit 3 = not found or ambiguous, nothing changed; exit 4 = server unreachable.
