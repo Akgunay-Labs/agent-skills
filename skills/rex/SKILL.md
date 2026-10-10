@@ -1,0 +1,91 @@
+---
+name: rex
+description: Use when a lead agent must create Rex terminal blocks, launch or resume executor or reviewer agents in them, send them input, or collect and verify their results, from inside a Rex pane or from an outside controller such as Codex Desktop. Not for Herdr, tmux, or other terminals, and not for Rex server, hosts, config, or keymap administration.
+---
+
+# Rex orchestration
+
+Rex is a terminal multiplexer: sessions hold windows (tabs), windows hold blocks (terminals); the `rex` CLI drives them. Tested against Rex `0.0.1791515941-gd9a4b5`, Claude Code 2.1.295, Codex 0.162.1 on 2026-10-10. If `rex version` differs, re-check commands with `rex help <cmd>` and `rex api describe <method>` first.
+
+Helper for everything below: `python3 -I <this skill>/scripts/rex_assign.py <subcommand> --help`.
+
+## 1. Bind the target before anything else
+
+- **Inside a Rex pane:** `rex whoami --json` gives your `session_id`, `window_id`, `block_id`, `instance_id`. Store them. Still pass `-s SESSION` and `-b BLOCK` on every command that creates, types, or closes; defaults resolve to the focused block, which is not necessarily yours.
+- **Outside Rex** (Codex Desktop, a plain shell, a daemon): no `REX_*` variables exist. Use `"$REX_BIN_DIR/rex"` or `/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex`. Choose the session from `rex ls --json` by the full ID the user named. More than one session and none named: stop and ask, or create your own with `rex new LABEL --cwd DIR --json`. Never pick the first or the most recent.
+- **Codex inside a Rex pane** loses `REX_*` in the commands it runs. Launch it as `codex --no-daemon -c shell_environment_policy.inherit=all` (interactive) or `codex exec --approve-for-me -c shell_environment_policy.inherit=all` (headless), per launch, never by editing its config.
+- **IDs only.** Store and script full IDs (`session:…`, `block:…`), never labels or short suffixes: labels change and suffixes collide. Exit 3 means not found or ambiguous and nothing changed; exit 4 means the server is unreachable.
+- **Server identity.** Keep `instance_id`. A different value later means Rex restarted and every stored ID is stale: re-bind, do not retry.
+- **Three different permissions.** Direct server commands (`split`, `run`, `send`, `capture`, `wait`, `block call`) work without Remote Control. App actions (`rex do pane.*`, `client.perform`) need the Rex app with Remote Control on. Codex's sandbox approval for the Rex socket is a host-tool permission, unrelated to both.
+
+Full recipes and the exit-code table: `references/targets-and-entry-paths.md`.
+
+## 2. Pick a worker mode
+
+| | Mode A: process per assignment (default) | Mode B: interactive worker |
+|---|---|---|
+| Worker | `claude -p` or `codex exec` in its own block, `--keep-open` | long-lived `claude` or `codex` TUI in its own block |
+| Input | brief file + one-line prompt at launch | `send` one line pointing at a file, then `watch` |
+| Done | child exit via `rex wait`, then the result file | fresh turn marker written by the agent's own hook, then the result file |
+| Approvals | fixed at launch (`--permission-mode`, `--allowedTools`); denials appear in the result | a `blocked` marker; a person answers, never you |
+| Resume | `resume` (new block, same agent session) | `send` the follow-up |
+
+Default to Mode A. Details: `references/assignment-lifecycle.md` (A), `references/interactive-workers.md` (B).
+
+## 3. Assignment flow
+
+1. Write the brief to a file. End it with: "Write `REPORT.md` in `$RUN_DIR` with what changed, how you verified, what you did not do."
+2. `rex_assign.py launch --agent claude|codex --session S (--anchor B [--split right] | --new-window) --cwd DIR --brief FILE [--model M] [--permission P] [--allow TOOL …] [--worktree] [--mode interactive]`. It writes a marker, creates the block, records `assignment.json` under `~/.local/state/rex-orch/runs/<id>/`, and prints the record. Every created block is in a record; nothing is created by hand.
+3. Mode A: `wait <id> --for 30m`. Mode B: `send <id> --text '…'` then `watch <id> --for 20m`.
+4. Read `result.json` (or `events.jsonl` + `last-message.md`) and `REPORT.md`. The state is `completed-unreviewed` at best.
+5. Review: launch a second assignment with `--role reviewer` and a read-only policy whose brief asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Only that file moves the executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
+6. Finish: `cancel <id> --close` closes the block and keeps a terminal state; `list` shows everything you own.
+
+PR-producing work runs with `--worktree` (agent-managed), never a shell-created worktree.
+
+## 4. What a signal proves
+
+| Signal | Proves | Does not prove |
+|---|---|---|
+| `send` exit 0 | bytes reached the pty | the agent read or accepted them |
+| quiet or unchanged screen | nothing | idle, done, stuck |
+| Rex record `working`/`idle` (owner `claude`/`codex`) | heuristic activity | completion; `idle` also follows an interrupt |
+| Rex record `done`/`error` | a finish, if `updated_at` is newer than your send and `app` is set | this assignment, unless the owner pid matches |
+| hook marker `stop` newer than `sent_at` | the agent ended that turn | the task succeeded |
+| `rex wait` returned / `child_exited` | the process ended | success: read exit + result |
+| `result.json` `subtype:success`, `permission_denials:[]` | the agent reports completing the task | reviewer acceptance |
+| `review.json` `verdict:accepted` | acceptance | nothing further |
+
+## 5. Never
+
+- Never target the focused block, the first session, a label, or a suffix. Full IDs, every call.
+- Never type into a block you did not create or whose record does not name you as owner.
+- Never answer a permission dialog for the worker (`send-key enter` on "Do you want to proceed?"). Report `blocked:<type>` and the dialog text; a person decides.
+- Never call a quiet screen, `idle`, or a successful `send` "done". Done needs exit plus artifact (A) or a fresh marker plus artifact (B).
+- Never read other agents' transcripts under `~/.claude` or `~/.codex` to learn what happened. Records, result files and `capture` are the evidence.
+- Never leave a block or session you created unrecorded. Record first, then close or hand over, and say which.
+- Never run `rex kill`, `rex server`, `rex config`, `rex hosts`, `rex home` from this skill, and never edit `~/.codex/config.toml` or `~/.claude/settings.json` for a worker; per-launch flags only.
+- Never replace `rex wait`/`watch` with a sleep loop.
+
+## 6. Raw commands when the helper does not fit
+
+```sh
+rex split -s S -b B --split right --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec claude …'
+rex run   -s S --focus=false --keep-open --label L --cwd DIR --json -- sh -c 'exec codex …'   # new window
+rex wait  -s S --for 30m --json BLOCK      # exit = child's exit; timeout prints no JSON and exits 1
+rex capture -s S -b BLOCK --trim           # current screen only, not a transcript
+rex block call process -s S -b BLOCK ; rex block call program_status -s S -b BLOCK
+rex send -s S -b BLOCK 'one line' ; rex send-key -s S -b BLOCK enter      # also: ctrl+c, escape
+rex events -s S --json                     # NDJSON stream; give it an owner and kill it
+rex block close -s S BLOCK
+```
+
+Always `exec` the agent inside `sh -c` so the foreground process is the agent, not `bash`. The command after `--` is not shell-parsed; `sh -c` gives you redirects.
+
+## 7. Discovery
+
+`rex help <cmd>`, `rex api list -q`, `rex api describe <method>`, `rex block inspect -s S BLOCK --json` (block methods and schemas). `rex api call` needs `-s "$REX_SESSION"`; it does not default to your session.
+
+## Known limits (2026-10-10)
+
+Claude Code emits no status protocol; Rex shows a heuristic `idle`/`working` record only for an exec'd interactive `claude`, none for `claude -p`. Codex's TUI emits real `app=codex` records. A Mode A worker killed before its first turn completes has no transcript: `resume` reports `abandoned:no-transcript`. Direct commands were verified only with Remote Control on. Codex Desktop as controller is untested end to end.
