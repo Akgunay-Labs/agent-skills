@@ -39,9 +39,10 @@ Marker sequence seen in one session: `session_start prompt stop prompt stop prom
 | `turn-ended:hook` | `stop` marker newer than `sent_at` | the agent ended that turn |
 | `turn-ended:status` | Rex `done`/`error` record with `app` newer than `sent_at` (Codex native, or Claude with `--osc-status`) | same, from Rex's side |
 | `turn-ended:heuristic` | bell **and** `idle` record after `sent_at`, no marker | weak; say so |
+| `taken-over:person` | a `prompt` marker after `sent_at` that is not one of this lead's sends | a person is driving the worker; stop, report, do not re-send (**live**: seen when a person rejected a dialog and kept typing) |
 | `no-fresh-evidence` | nothing newer than `sent_at` within `--for` | unknown; `status`, then decide |
 
-No turn end is task completion. Completion still needs the artifact the brief asked for (`REPORT.md`, `review.json`, …). An interrupt yields no `stop`, so `watch` after `cancel` (without `--close`) reports `no-fresh-evidence`, which is correct.
+`record.state` is a cache written by the last command; `status` recomputes `live.outcome` and `live.blocked_open` from the markers and Rex records now, and the two can differ when a person acted in between. No turn end is task completion. Completion still needs the artifact the brief asked for (`REPORT.md`, `review.json`, …). An interrupt yields no `stop`, so `watch` after `cancel` (without `--close`) reports `no-fresh-evidence`, which is correct.
 
 ## Cancel vs interrupt
 

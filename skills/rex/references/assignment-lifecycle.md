@@ -60,16 +60,17 @@ Codex `events.jsonl` (**live**): `thread.started{thread_id}`, `turn.started`, `i
 | 0 | missing/empty | `exited-without-result`: usually a launch or redirect problem |
 | 0 | `is_error` or `subtype≠success` | `failed:<subtype>` |
 | 0 | `permission_denials` non-empty | `completed-with-denials`: list the tools; re-run only with a policy the user authorizes, never `bypassPermissions` on your own |
+| 0 | clean but `--deliverable` file missing | `completed-without-deliverable`: the agent said done, the brief's output is not there |
 | 0 | clean | `completed-unreviewed` |
 
 ## Review handoff
 
-Executor brief ends with the `REPORT.md` request (what changed, how verified, what not done). Reviewer: `launch --role reviewer` with a read-only policy (Claude `--permission plan`; Codex `-s read-only` via `--permission read-only`) and a brief pointing at the worktree/diff and `REPORT.md`, asking for `review.json`:
+Executor brief ends with the `REPORT.md` request (what changed, how verified, what not done); launch it with `--deliverable REPORT.md`. Reviewer: `launch --role reviewer --permission acceptEdits --deliverable review.json` (**live**: a plan-mode reviewer cannot write the file, and path-scoped `Write(...)` allow rules did not match; tool-level `--allow Write` or `acceptEdits` does) with a brief that says "do not modify anything outside `$RUN_DIR`" and points at the worktree/diff and `REPORT.md`, asking for `review.json`:
 
 ```json
 {"verdict": "accepted" | "changes-requested", "findings": [{"file": "", "line": 0, "summary": ""}]}
 ```
-Record the verdict on the executor's record. `changes-requested` → `resume <executor> --brief findings.md`. Nothing else moves an assignment to `accepted`. Two workers never share a working tree: PR work uses `--worktree` (`claude --worktree` / `codex exec --worktree`); never `git worktree add` from a shell.
+Record it with `review <executor-id> --reviewer <reviewer-id>` (or `--from-file review.json`); the helper refuses verdicts other than the two above and refuses to review an assignment that did not complete. `changes-requested` → `resume <executor> --brief findings.md` (the resumed run keeps the original agent session id in its record). Nothing else moves an assignment to `accepted`. Two workers never share a working tree: PR work uses `--worktree` (`claude --worktree` / `codex exec --worktree`); never `git worktree add` from a shell.
 
 ## Cancel, timeout, exit, recovery (**live** unless noted)
 

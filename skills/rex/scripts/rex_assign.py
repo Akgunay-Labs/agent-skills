@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rex_assign.py: launch, observe, and collect agent assignments in Rex blocks.
 
-Subcommands: launch | wait | status | send | watch | notify | cancel | resume | list
+Subcommands: launch | wait | status | send | watch | notify | cancel | resume | review | list
 Run with: python3 -I rex_assign.py <subcommand> --help
 
 Every mutating rex call carries an explicit session (and block). Nothing here
@@ -190,6 +190,32 @@ def input_has_text(capture):
     return bool(body) and not body.startswith(INPUT_PLACEHOLDERS)
 
 
+def session_id_for(agent, resume_of, fresh):
+    """Claude: the session id the worker really runs under (resume keeps the original). Codex: none (thread id comes from events)."""
+    if agent != "claude":
+        return None
+    return resume_of or fresh
+
+
+def apply_deliverable(state, deliverable_path):
+    """A completed worker without the file the brief asked for is not complete."""
+    if state == "completed-unreviewed" and deliverable_path is not None and not pathlib.Path(deliverable_path).exists():
+        return "completed-without-deliverable"
+    return state
+
+
+def apply_review(rec, review, reviewer_id):
+    """Record a reviewer's verdict on an executor record. Only this moves a record to accepted."""
+    if not str(rec.get("state", "")).startswith("completed"):
+        raise ValueError(f"cannot review an assignment in state {rec.get('state')!r}")
+    verdict = review.get("verdict")
+    if verdict not in ("accepted", "changes-requested"):
+        raise ValueError(f"review.json verdict must be accepted or changes-requested, got {verdict!r}")
+    rec["review"] = {"reviewer_assignment_id": reviewer_id, "verdict": verdict, "findings": review.get("findings", []), "at": now_iso()}
+    rec["state"] = verdict
+    return rec
+
+
 def check_server(stored_server, whoami):
     if stored_server.get("instance_id") and stored_server.get("instance_id") != whoami.get("instance_id"):
         return "abandoned:server-restarted"
@@ -224,10 +250,26 @@ def send_guards(record, process, turns, caller_block, capture=None):
     return failing
 
 
-def watch_outcome(turns, events, sent_at):
+def _is_own_prompt(ts, sends, window_s=8):
+    """A prompt marker within a few seconds after one of our sends is ours; anything else was typed by someone."""
+    for s in sends or []:
+        try:
+            d = (datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")) - datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))).total_seconds()
+        except ValueError:
+            continue
+        if 0 <= d <= window_s:
+            return True
+    return False
+
+
+def watch_outcome(turns, events, sent_at, sends=None):
     fresh_t = [t for t in turns if t.get("ts", "") > sent_at]
     fresh_e = [e for e in events if e.get("ts", "") > sent_at]
     evidence = [f"turn:{t.get('ev')}@{t.get('ts')}" for t in fresh_t] + [f"event:{e.get('name')}@{e.get('ts')}" for e in fresh_e]
+    if sends is not None:
+        foreign = [t for t in fresh_t if t.get("ev") == "prompt" and not _is_own_prompt(t.get("ts", ""), sends)]
+        if foreign:
+            return "taken-over:person", evidence + [f"foreign prompt at {t.get('ts')} (not one of this lead's sends)" for t in foreign]
     if _blocked_open(fresh_t):
         t = [x for x in fresh_t if x.get("ev") == "blocked"][-1]
         return f"blocked:{t.get('notification_type') or 'unknown'}", evidence
@@ -341,7 +383,7 @@ def cmd_launch(a):
     brief_text = pathlib.Path(a.brief).read_text() if a.brief != "-" else sys.stdin.read()
     (run_dir / "brief.md").write_text(render_brief(brief_text, run_dir))
     policy = Policy(a.permission or ("acceptEdits" if a.agent == "claude" else "workspace-write"), a.allow or [])
-    agent_session_id = str(uuid.uuid4()) if a.agent == "claude" else None
+    agent_session_id = session_id_for(a.agent, a.resume_of, str(uuid.uuid4()))
     helper = stage_helper(run_dir) if a.mode == "interactive" else HELPER
     if a.mode == "interactive" and a.agent == "claude":
         (run_dir / "claude-settings.json").write_text(json.dumps(interactive_claude_settings(aid, helper, osc=a.osc_status), indent=2))
@@ -364,7 +406,8 @@ def cmd_launch(a):
                       "cwd": a.cwd, "agent_session_id": agent_session_id, "resume_of": a.resume_of},
            "paths": {"run_dir": str(run_dir), "brief": str(run_dir / "brief.md"),
                      "result": str(run_dir / ("result.json" if a.agent == "claude" else "events.jsonl")),
-                     "review": str(run_dir / "review.json"), "turns": str(run_dir / "turns.jsonl")},
+                     "review": str(run_dir / "review.json"), "turns": str(run_dir / "turns.jsonl"),
+                     "deliverable": str(run_dir / a.deliverable) if a.deliverable else None},
            "state": "launched", "launched_at": now_iso(), "exit": None, "review": None, "sends": []}
     save_record(rec)
     (run_dir / "launching").unlink(missing_ok=True)
@@ -417,13 +460,29 @@ def cmd_wait(a):
         print(json.dumps({"state": rec["state"], "detail": err.strip()})); return 1
     exit_code = parse_wait(rc, out)
     state, summary = classify(exit_code, rec["paths"]["result"], rec["worker"]["agent"])
+    state = apply_deliverable(state, rec["paths"].get("deliverable"))
+    if state == "completed-without-deliverable":
+        summary = f"worker reported success but {rec['paths']['deliverable']} is missing; " + summary
     if state == "timeout" and a.cancel_on_timeout:
         do_cancel(rec, close=False); state = "cancelled"
     rec["exit"] = None if exit_code is None else {"code": exit_code, "at": now_iso()}
     rec["state"] = state; save_record(rec)
     out_obj = {"assignment_id": rec["assignment_id"], "state": state, "exit": rec["exit"], "summary": summary, "result_path": rec["paths"]["result"]}
     print(json.dumps(out_obj, indent=2))
-    return 0 if state.startswith("completed") else 1
+    return 0 if state in ("completed-unreviewed", "completed-with-denials") else 1
+
+
+def cmd_review(a):
+    ex = load_record(a.assignment_id)
+    src = pathlib.Path(a.from_file) if a.from_file else pathlib.Path(load_record(a.reviewer)["paths"]["run_dir"]) / "review.json"
+    if not src.exists():
+        print(f"no review.json at {src}", file=sys.stderr); return 1
+    try:
+        apply_review(ex, json.loads(src.read_text()), a.reviewer or str(src))
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"review not applied: {e}", file=sys.stderr); return 1
+    save_record(ex)
+    print(json.dumps({"assignment_id": ex["assignment_id"], "state": ex["state"], "review": ex["review"]}, indent=2)); return 0
 
 
 def cmd_status(a):
@@ -440,7 +499,12 @@ def cmd_status(a):
     _, st = block_call(sid, b, "program_status")
     recs = st.get("records", [])
     info["program_status"] = [{**r, "fresh": r.get("updated_at", "") > rec.get("launched_at", "")} for r in recs]
-    info["turns_tail"] = read_turns(rec["paths"]["run_dir"])[-5:]
+    turns = read_turns(rec["paths"]["run_dir"])
+    info["turns_tail"] = turns[-5:]
+    if rec["worker"]["mode"] == "interactive":
+        last_sent = (rec.get("sends") or [{}])[-1].get("sent_at") or rec.get("launched_at", "")
+        live, ev = watch_outcome(turns, [{"name": "program_status_changed", "ts": r.get("updated_at", ""), "record": r} for r in recs], last_sent, sends=[x["sent_at"] for x in rec.get("sends", [])])
+        info["live"] = {"outcome": live, "blocked_open": _blocked_open(turns), "note": "record.state is a cache; live is recomputed from markers and status now"}
     _, _, cap, _ = rex("capture", "-s", sid, "-b", b, "--trim", json_out=False)
     info["capture_tail"] = cap.splitlines()[-20:]
     print(json.dumps(info, indent=2)); return 0
@@ -498,13 +562,13 @@ def cmd_watch(a):
     th = threading.Thread(target=pump, daemon=True); th.start()
     limit = parse_duration(a.for_); t0 = time.time(); outcome, evidence = "no-fresh-evidence", []
     while time.time() - t0 < limit:
-        outcome, evidence = watch_outcome(read_turns(rec["paths"]["run_dir"]), list(events), sent_at)
+        outcome, evidence = watch_outcome(read_turns(rec["paths"]["run_dir"]), list(events), sent_at, sends=[x["sent_at"] for x in rec.get("sends", [])])
         if outcome != "no-fresh-evidence":
             break
         time.sleep(2)
     stop.set()
     rec["last_watch"] = {"outcome": outcome, "evidence": evidence, "at": now_iso()}
-    if outcome.startswith("blocked"):
+    if outcome.startswith("blocked") or outcome.startswith("taken-over"):
         rec["state"] = outcome
     elif outcome == "exited":
         rec["state"] = "exited"
@@ -594,6 +658,7 @@ def cmd_resume(a):
     ns.cwd = a.cwd or w.get("cwd"); ns.model = a.model or w.get("model"); ns.effort = a.effort or w.get("effort")
     ns.permission = a.permission or w["permission_policy"]["mode"]; ns.allow = a.allow or w["permission_policy"].get("allowed_tools")
     ns.worktree = False; ns.label = None; ns.assignment_id = None; ns.prompt = None; ns.osc_status = False
+    ns.deliverable = pathlib.Path(old["paths"]["deliverable"]).name if old["paths"].get("deliverable") else None
     ns.as_owner = old["owner"].get("block_id"); ns.controller = old["owner"].get("controller"); ns.external = old["owner"].get("kind") == "external"
     return cmd_launch(ns)
 
@@ -648,6 +713,7 @@ def main(argv=None):
         sp.add_argument("--assignment-id"); sp.add_argument("--prompt", help="override the one-line prompt (default points at brief.md)")
         sp.add_argument("--as-owner", help="owner block id when running as an external controller"); sp.add_argument("--controller", default=os.environ.get("REX_ORCH_CONTROLLER", "unknown"))
         sp.add_argument("--external", action="store_true", help="outside controller: ignore any inherited REX_* pane identity")
+        sp.add_argument("--deliverable", help="file the brief must produce, relative to the run dir (e.g. REPORT.md, review.json); wait downgrades completion when it is missing")
         sp.add_argument("--resume-of", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("launch", help="create a block and start a worker"); launch_args(sp); sp.set_defaults(fn=cmd_launch)
@@ -658,6 +724,7 @@ def main(argv=None):
     sp = sub.add_parser("notify", help="(hooks) append a turn marker"); sp.add_argument("assignment_id"); sp.add_argument("payload", nargs="?"); sp.add_argument("--ev"); sp.add_argument("--osc", action="store_true"); sp.set_defaults(fn=cmd_notify)
     sp = sub.add_parser("cancel", help="interrupt, optionally close"); sp.add_argument("assignment_id"); sp.add_argument("--close", action="store_true"); sp.set_defaults(fn=cmd_cancel)
     sp = sub.add_parser("resume", help="new block continuing a process-mode worker's session"); sp.add_argument("assignment_id"); launch_args(sp); sp.set_defaults(fn=cmd_resume)
+    sp = sub.add_parser("review", help="record a reviewer's review.json verdict on an executor assignment"); sp.add_argument("assignment_id", help="executor assignment"); g = sp.add_mutually_exclusive_group(required=True); g.add_argument("--reviewer", help="reviewer assignment id (its run dir holds review.json)"); g.add_argument("--from-file", help="path to a review.json"); sp.set_defaults(fn=cmd_review)
     sp = sub.add_parser("list", help="list assignments"); sp.add_argument("--state"); sp.set_defaults(fn=cmd_list)
     a = p.parse_args(argv)
     if a.runs_root:

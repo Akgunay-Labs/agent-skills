@@ -111,10 +111,11 @@ class Classification(unittest.TestCase):
 
     def test_interactive_commands_use_staged_helper_path(self):
         p = ra.build_worker_command("codex", "interactive", ra.Policy("default", []), RUN, None, assignment_id="a-1", helper=RUN / "rex_assign.py")
-        self.assertIn(str(RUN / "rex_assign.py"), p)
-        self.assertNotIn(str(ra.HELPER), p)
+        parts = shlex.split(p)
+        self.assertTrue(any(str(RUN / "rex_assign.py") in x for x in parts))
+        self.assertFalse(any(str(ra.HELPER) in x for x in parts))
         s = ra.interactive_claude_settings("a-1", RUN / "rex_assign.py")
-        self.assertIn(str(RUN / "rex_assign.py"), s["hooks"]["Stop"][0]["hooks"][0]["command"])
+        self.assertIn(str(RUN / "rex_assign.py"), shlex.split(s["hooks"]["Stop"][0]["hooks"][0]["command"]))
 
     def test_stage_helper_copies_script_into_run_dir(self):
         with tempfile.TemporaryDirectory() as d:
@@ -149,6 +150,28 @@ class Classification(unittest.TestCase):
 
     def test_brief_run_dir_substitution(self):
         self.assertEqual(ra.render_brief("Write REPORT.md in $RUN_DIR now. ${RUN_DIR}/x", pathlib.Path("/r/a-1")), "Write REPORT.md in /r/a-1 now. /r/a-1/x")
+
+    def test_resume_keeps_original_agent_session_id(self):
+        self.assertEqual(ra.session_id_for(agent="claude", resume_of="orig-1", fresh="new-1"), "orig-1")
+        self.assertEqual(ra.session_id_for(agent="claude", resume_of=None, fresh="new-1"), "new-1")
+        self.assertIsNone(ra.session_id_for(agent="codex", resume_of=None, fresh="new-1"))
+
+    def test_deliverable_missing_downgrades_completion(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ra.apply_deliverable("completed-unreviewed", pathlib.Path(d) / "review.json"), "completed-without-deliverable")
+            (pathlib.Path(d) / "review.json").write_text("{}")
+            self.assertEqual(ra.apply_deliverable("completed-unreviewed", pathlib.Path(d) / "review.json"), "completed-unreviewed")
+            self.assertEqual(ra.apply_deliverable("failed", pathlib.Path(d) / "nope"), "failed")
+
+    def test_apply_review_sets_verdict_state(self):
+        rec = {"state": "completed-unreviewed", "review": None}
+        self.assertEqual(ra.apply_review(rec, {"verdict": "accepted", "findings": []}, "a-rev")["state"], "accepted")
+        rec = {"state": "completed-unreviewed", "review": None}
+        self.assertEqual(ra.apply_review(rec, {"verdict": "changes-requested", "findings": [{"summary": "x"}]}, "a-rev")["state"], "changes-requested")
+        with self.assertRaises(ValueError):
+            ra.apply_review({"state": "launched"}, {"verdict": "accepted"}, "a-rev")
+        with self.assertRaises(ValueError):
+            ra.apply_review({"state": "completed-unreviewed"}, {"verdict": "maybe"}, "a-rev")
 
     def test_states_never_say_accepted_without_review(self):
         for st in ra.TERMINAL_STATES:
@@ -221,6 +244,19 @@ class ModeB(unittest.TestCase):
     def test_watch_child_exited_is_exited(self):
         ev = [{"name": "child_exited", "ts": "2026-10-10T00:05:02Z", "payload": {"exit_code": 0}}]
         self.assertEqual(ra.watch_outcome([], ev, sent_at="2026-10-10T00:04:00Z")[0], "exited")
+
+    def test_watch_foreign_prompt_means_taken_over(self):
+        sends = ["2026-10-10T00:04:00Z"]
+        turns = [{"ev": "prompt", "ts": "2026-10-10T00:04:01Z"}, {"ev": "stop", "ts": "2026-10-10T00:04:10Z"},
+                 {"ev": "prompt", "ts": "2026-10-10T00:06:00Z"}, {"ev": "stop", "ts": "2026-10-10T00:06:05Z"}]
+        out, ev = ra.watch_outcome(turns, [], sent_at=sends[-1], sends=sends)
+        self.assertEqual(out, "taken-over:person")
+        self.assertTrue(any("foreign prompt" in e for e in ev))
+
+    def test_watch_own_prompt_marker_is_not_foreign(self):
+        sends = ["2026-10-10T00:04:00Z"]
+        turns = [{"ev": "prompt", "ts": "2026-10-10T00:04:02Z"}, {"ev": "stop", "ts": "2026-10-10T00:04:10Z"}]
+        self.assertEqual(ra.watch_outcome(turns, [], sent_at=sends[-1], sends=sends)[0], "turn-ended:hook")
 
     def test_watch_interrupt_marker_is_not_turn_end(self):
         turns = [{"ev": "prompt", "ts": "2026-10-10T00:05:00Z"}, {"ev": "interrupted", "ts": "2026-10-10T00:05:30Z"}]

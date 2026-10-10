@@ -5,7 +5,7 @@ description: Use when a lead agent must create Rex terminal blocks, launch or re
 
 # Rex orchestration
 
-Rex is a terminal multiplexer: sessions hold windows (tabs), windows hold blocks (terminals); the `rex` CLI drives them. Tested against Rex `0.0.1791515941-gd9a4b5`, Claude Code 2.1.295, Codex 0.162.1 on 2026-10-10. If `rex version` differs, re-check commands with `rex help <cmd>` and `rex api describe <method>` first.
+Rex is a terminal multiplexer: sessions hold windows (tabs), windows hold blocks (terminals); the `rex` CLI drives them. Tested against Rex `0.0.1791564903-g7abb0a`, Claude Code 2.1.296, Codex 0.162.1 on 2026-10-10. A newer `rex version` is fine until a command here fails; then confirm it with `rex help <cmd>` or `rex api describe <method>` before working around it.
 
 Helper for everything below: `python3 -I <this skill>/scripts/rex_assign.py <subcommand> --help`.
 
@@ -35,10 +35,10 @@ Default to Mode A. Details: `references/assignment-lifecycle.md` (A), `reference
 ## 3. Assignment flow
 
 1. Write the brief to a file. End it with: "Write `REPORT.md` in `$RUN_DIR` with what changed, how you verified, what you did not do." The helper replaces `$RUN_DIR` with the real run directory at launch.
-2. `rex_assign.py launch --agent claude|codex --session S (--anchor B [--split right] | --new-window) --cwd DIR --brief FILE [--model M] [--permission P] [--allow TOOL …] [--worktree] [--mode interactive]`. It writes a marker, creates the block, records `assignment.json` under `~/.local/state/rex-orch/runs/<id>/`, and prints the record. Every created block is in a record; nothing is created by hand.
+2. `rex_assign.py launch --agent claude|codex --session S (--anchor B [--split right] | --new-window) --cwd DIR --brief FILE --deliverable REPORT.md [--model M] [--permission P] [--allow TOOL …] [--worktree] [--mode interactive]`. `--deliverable` names the file the brief must produce; without it, `wait` can only say the process ended. It writes a marker, creates the block, records `assignment.json` under `~/.local/state/rex-orch/runs/<id>/`, and prints the record. Every created block is in a record; nothing is created by hand.
 3. Mode A: `wait <id> --for 30m`. Mode B: `send <id> --text '…'` then `watch <id> --for 20m`. `send` refuses (exit 6) and names the guard when you are not the owner, the agent is not in the foreground, a dialog is open, or text is left in the input box.
 4. Read `result.json` (or `events.jsonl` + `last-message.md`) and `REPORT.md`. The state is `completed-unreviewed` at best: the worker's deliverable exists and it says it finished. For a standalone reviewer or research task, that plus the deliverable file is the end.
-5. Executor work gets a review: launch a second assignment with `--role reviewer` and a read-only policy whose brief asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Only that file moves the executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
+5. Executor work gets a review: launch a second assignment with `--role reviewer --permission acceptEdits --deliverable review.json` (plan mode cannot write the file) and a brief that forbids touching the repo and asks for `review.json` `{"verdict": "accepted"|"changes-requested", "findings": [...]}`. Then `review <executor-id> --reviewer <reviewer-id>` records the verdict; nothing else moves an executor to `accepted`. Changes requested: `resume`/`send` the findings to the executor.
 6. Finish: `cancel <id> --close` closes the block and keeps a terminal state; `list` shows everything you own.
 
 PR-producing work runs with `--worktree` (agent-managed), never a shell-created worktree.
@@ -51,7 +51,7 @@ PR-producing work runs with `--worktree` (agent-managed), never a shell-created 
 | quiet or unchanged screen | nothing | idle, done, stuck |
 | Rex record `working`/`idle` (owner `claude`/`codex`) | heuristic activity | completion; `idle` also follows an interrupt |
 | Rex record `done`/`error` | a finish, if `updated_at` is newer than your send and `app` is set | this assignment, unless the owner pid matches |
-| hook marker `stop` newer than `sent_at` | the agent ended that turn | the task succeeded |
+| hook marker `stop` newer than `sent_at` | the agent ended that turn | the task succeeded, or that the turn was yours: a `prompt` marker you did not send means a person took over (`taken-over:person`) |
 | `rex wait` returned / `child_exited` | the process ended | success: read exit + result |
 | `result.json` `subtype:success`, `permission_denials:[]` | the agent reports completing the task | reviewer acceptance |
 | `review.json` `verdict:accepted` | acceptance | nothing further |
@@ -60,7 +60,7 @@ PR-producing work runs with `--worktree` (agent-managed), never a shell-created 
 
 - Never target the focused block, the first session, a label, or a suffix. Full IDs, every call.
 - Never type into a block you did not create or whose record does not name you as owner.
-- Never answer a permission dialog for the worker (`send-key enter` on "Do you want to proceed?"). Report `blocked:<type>` and the dialog text; a person decides.
+- Never answer a permission dialog for the worker (`send-key enter` on "Do you want to proceed?"). Report `blocked:<type>` and the dialog text; a person decides. If a person already answered or typed into the worker (`taken-over:person`), stop and report; do not re-send.
 - Never call a quiet screen, `idle`, or a successful `send` "done". Done needs exit plus artifact (A) or a fresh marker plus artifact (B).
 - Never read other agents' transcripts under `~/.claude` or `~/.codex` to learn what happened. Records, result files and `capture` are the evidence.
 - Never leave a block or session you created unrecorded. Record first, then close or hand over, and say which. Close only what you created: `block close` for your blocks, `session kill` only for a session you created and recorded.
