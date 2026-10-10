@@ -1,0 +1,14 @@
+# Repository rules
+
+- Skills live under `skills/<name>/`. Author or edit them with the
+  `superpowers:writing-skills` workflow (baseline test → write → re-test) and
+  validate with `python3 scripts/check.py`.
+- Commit flow: direct commits to `main` while a skill is pre-release. From
+  a skill's first release tag on (for example `rex/v0.1.0`), changes go
+  through a pull request opened from a Codex-managed worktree.
+- Nothing machine-specific or private enters the repository: no
+  `session:`/`block:` IDs, no personal hook paths, no credentials, no run
+  state. Run state belongs under `~/.local/state/`.
+- Anything removed is moved to the Trash, never deleted with `rm`.
+- Do not duplicate tool manuals into a skill; point at the tool's own
+  discovery path (`--help`, `api describe`) and pin the version you tested.
