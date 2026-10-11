@@ -11,24 +11,30 @@ def no_subprocess(*a, **k):
     raise AssertionError("subprocess must not be called here")
 
 
+def agent_argv(payload):
+    """The exec'd agent argv of a process-mode payload: banner and redirect stripped."""
+    cmd = "exec " + payload.split("; exec ", 1)[1] if "; exec " in payload else payload
+    return shlex.split(cmd.split(" > ")[0])
+
+
 class CommandBuilding(unittest.TestCase):
     def test_command_quoting_preserves_brief_pointer_and_redirect(self):
         payload = ra.build_worker_command("claude", "process", ra.Policy("acceptEdits", ["Read", "Bash(git *)"]), RUN, "u-1", model="sonnet")
-        parts = shlex.split(payload.split(" > ")[0])
+        parts = agent_argv(payload)
         self.assertEqual(parts[0:3], ["exec", "claude", "-p"])
         self.assertIn(f"Read {RUN}/brief.md and do exactly what it says.", parts)
         self.assertIn("Bash(git *)", parts)
-        self.assertTrue(payload.endswith(shlex.quote(str(RUN / "result.json"))))
+        self.assertTrue(payload.endswith(shlex.quote(str(RUN / "stream.jsonl"))))
         self.assertNotIn("\n", payload)
 
     def test_claude_process_policy_flags(self):
         p = ra.build_worker_command("claude", "process", ra.Policy("plan", []), RUN, "u-1")
-        for flag in ("--permission-mode plan", "--permission-prompts none", "--output-format json", "--session-id u-1"):
+        for flag in ("--permission-mode plan", "--permission-prompts none", "--output-format stream-json --verbose", "--session-id u-1"):
             self.assertIn(flag, p)
 
     def test_codex_process_command(self):
         p = ra.build_worker_command("codex", "process", ra.Policy("workspace-write", []), RUN, None, worktree=True, cwd="/repo")
-        parts = shlex.split(p.split(" > ")[0])
+        parts = agent_argv(p)
         self.assertEqual(parts[0:3], ["exec", "codex", "exec"])
         for flag in ("--approve-for-me", "-c", "shell_environment_policy.inherit=all", "--skip-git-repo-check", "--json", "--worktree", "-o", "-C"):
             self.assertIn(flag, parts)
@@ -110,7 +116,7 @@ class Classification(unittest.TestCase):
 
     def test_codex_process_command_adds_run_dir_to_sandbox(self):
         p = ra.build_worker_command("codex", "process", ra.Policy("workspace-write", []), RUN, None)
-        parts = shlex.split(p.split(" > ")[0])
+        parts = agent_argv(p)
         self.assertIn("--add-dir", parts)
         self.assertIn(str(RUN), parts)
 
@@ -319,7 +325,8 @@ class FixPass(unittest.TestCase):
     def test_parse_wait_distinguishes_rex_outcomes(self):
         self.assertEqual(ra.parse_wait(0, '{"exit_code":0}\n'), ("exit", 0))
         self.assertEqual(ra.parse_wait(1, '{"exit_code":1,"error":"exit status 1"}\n'), ("exit", 1))
-        self.assertEqual(ra.parse_wait(1, ""), ("timeout", None))
+        self.assertEqual(ra.parse_wait(1, "", "Error: wait timed out\n"), ("timeout", None))
+        self.assertEqual(ra.parse_wait(1, "", "Error: something else\n"), ("rex-error", 1))
         self.assertEqual(ra.parse_wait(3, ""), ("not-found", None))
         self.assertEqual(ra.parse_wait(4, ""), ("server-unreachable", None))
         self.assertEqual(ra.parse_wait(130, ""), ("interrupted", None))
@@ -327,8 +334,8 @@ class FixPass(unittest.TestCase):
     # Important 5: policy actually reaches the agent
     def test_codex_commands_carry_sandbox_mode(self):
         p = ra.build_worker_command("codex", "process", ra.Policy("read-only", []), RUN, None)
-        self.assertIn("read-only", shlex.split(p.split(" > ")[0]))
-        self.assertIn("-s", shlex.split(p.split(" > ")[0]))
+        self.assertIn("read-only", agent_argv(p))
+        self.assertIn("-s", agent_argv(p))
         q = ra.build_worker_command("codex", "interactive", ra.Policy("read-only", []), RUN, None, assignment_id="a-1")
         self.assertIn("read-only", shlex.split(q))
 
@@ -377,6 +384,127 @@ class FixPass(unittest.TestCase):
         self.assertEqual(ra.owner_mismatch({"owner": {"block_id": None}}, None), False)
 
 
+class FieldNotes(unittest.TestCase):
+    """Fixes from the first real-workflow run (2026-10-10)."""
+
+    def test_missing_deliverable_wins_over_denials(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ra.apply_deliverable("completed-with-denials", pathlib.Path(d) / "REPORT.md"), "completed-without-deliverable")
+            (pathlib.Path(d) / "REPORT.md").write_text("x")
+            self.assertEqual(ra.apply_deliverable("completed-with-denials", pathlib.Path(d) / "REPORT.md"), "completed-with-denials")
+
+    def test_denial_lines_carry_tool_input(self):
+        lines = ra.denial_lines([{"tool_name": "Edit", "tool_input": {"file_path": "/r/REPORT.md", "old_string": "a"}},
+                                 {"tool_name": "Bash", "tool_input": {"command": "ls; find . -name '*.py' " + "x" * 200}},
+                                 {"tool_name": "WebFetch", "tool_input": {"url": "https://example.com/a"}},
+                                 {"tool_name": "Mystery"}])
+        self.assertEqual(lines[0], "Edit /r/REPORT.md")
+        self.assertTrue(lines[1].startswith("Bash: ls; find ."))
+        self.assertLessEqual(len(lines[1]), 100)
+        self.assertEqual(lines[2], "WebFetch https://example.com/a")
+        self.assertEqual(lines[3], "Mystery")
+
+    def test_classify_denial_summary_names_inputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "result.json"
+            p.write_text(json.dumps({"subtype": "success", "is_error": False, "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": "rm x"}}]}))
+            self.assertIn("Bash: rm x", ra.classify(0, p, "claude")[1])
+
+    def test_denied_edit_on_deliverable_is_flagged(self):
+        den = [{"tool_name": "Edit", "tool_input": {"file_path": "/r/REPORT.md"}}]
+        self.assertTrue(ra.deliverable_denied(den, "/r/REPORT.md"))
+        self.assertFalse(ra.deliverable_denied(den, "/r/review.json"))
+        self.assertFalse(ra.deliverable_denied([{"tool_name": "Bash", "tool_input": {"command": "cat /r/REPORT.md"}}], "/r/REPORT.md"))
+        self.assertFalse(ra.deliverable_denied(den, None))
+
+    def test_claude_process_run_dir_is_writable_by_scoped_rule(self):
+        parts = agent_argv(ra.build_worker_command("claude", "process", ra.Policy("default", ["Read"]), RUN, "u-1"))
+        i = parts.index("--allowedTools")
+        self.assertIn(f"Edit(/{RUN}/**)", parts[i + 1:])  # //abs: Claude reads a single leading slash as project-relative
+        self.assertIn("Read", parts[i + 1:])
+        parts = agent_argv(ra.build_worker_command("claude", "process", ra.Policy("default", []), RUN, "u-1"))
+        self.assertIn(f"Edit(/{RUN}/**)", parts)
+
+    def test_process_payloads_print_a_banner_then_exec(self):
+        for agent in ("claude", "codex"):
+            p = ra.build_worker_command(agent, "process", ra.Policy("default", []), RUN, "u-1", assignment_id="a-1")
+            banner, rest = p.split("; exec ", 1)
+            self.assertIn("no live output", banner)
+            self.assertIn("status a-1", banner)
+            self.assertTrue(rest.startswith(agent))
+
+    def test_result_extracted_from_stream(self):
+        with tempfile.TemporaryDirectory() as d:
+            s, r = pathlib.Path(d) / "stream.jsonl", pathlib.Path(d) / "result.json"
+            s.write_text('{"type":"system","subtype":"init"}\n{"type":"result","subtype":"success","result":"ok"}\n')
+            self.assertTrue(ra.result_from_stream(s, r))
+            self.assertEqual(json.loads(r.read_text())["result"], "ok")
+            s2, r2 = pathlib.Path(d) / "s2.jsonl", pathlib.Path(d) / "r2.json"
+            s2.write_text('{"type":"system","subtype":"init"}\n{"type":"assist')
+            self.assertFalse(ra.result_from_stream(s2, r2))
+            self.assertFalse(r2.exists())
+
+    def test_stream_progress_claude(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = pathlib.Path(d) / "stream.jsonl"
+            ev = [{"type": "system", "subtype": "init"},
+                  {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/etc/hosts"}}]}},
+                  {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls /tmp"}}]}},
+                  {"type": "system", "subtype": "permission_denied"},
+                  {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}}]}}]
+            s.write_text("\n".join(json.dumps(e) for e in ev) + "\n{\"trunc")
+            prog = ra.stream_progress(s, "claude")
+            self.assertEqual(prog["tools"], {"Read": 2, "Bash": 1})
+            self.assertEqual(prog["last"][-1], "Read /x")
+            self.assertEqual(prog["denied"], 1)
+            self.assertEqual(ra.stream_progress(pathlib.Path(d) / "missing", "claude")["events"], 0)
+
+    def test_stream_progress_codex(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = pathlib.Path(d) / "events.jsonl"
+            s.write_text('{"type":"thread.started","thread_id":"t"}\n'
+                         '{"type":"item.completed","item":{"type":"command_execution","command":"git status","exit_code":0}}\n'
+                         '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n')
+            prog = ra.stream_progress(s, "codex")
+            self.assertEqual(prog["tools"], {"command_execution": 1, "agent_message": 1})
+            self.assertIn("shell: git status", prog["last"])
+
+    def test_codex_classify_tolerates_truncated_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "last-message.md").write_text("OK")
+            p = pathlib.Path(d) / "events.jsonl"
+            p.write_text('{"type":"turn.completed"}\n{"type":"item.comp')
+            self.assertEqual(ra.classify(0, p, "codex")[0], "completed-unreviewed")
+
+    def test_controller_detected_from_environment(self):
+        self.assertEqual(ra.detect_controller({"CLAUDECODE": "1", "CODEX_COMPANION_SESSION_ID": "x"}), "claude-code")
+        self.assertEqual(ra.detect_controller({"CODEX_THREAD_ID": "t"}), "codex")
+        self.assertEqual(ra.detect_controller({"REX_ORCH_CONTROLLER": "hermes", "CLAUDECODE": "1"}), "hermes")
+        self.assertEqual(ra.detect_controller({}), "unknown")
+
+    def test_window_id_from_block_inspect(self):
+        self.assertEqual(ra.window_id_from_inspect({"block": {"window_id": "window:1"}}), "window:1")
+        self.assertIsNone(ra.window_id_from_inspect({}))
+
+    def test_record_paths_match_what_the_mode_writes(self):
+        p = ra.record_paths(RUN, "claude", "process", "REPORT.md")
+        self.assertEqual(p["stream"], str(RUN / "stream.jsonl"))
+        self.assertEqual(p["result"], str(RUN / "result.json"))
+        self.assertEqual(p["deliverable"], str(RUN / "REPORT.md"))
+        self.assertNotIn("turns", p)
+        self.assertEqual(ra.record_paths(RUN, "codex", "process", None)["stream"], str(RUN / "events.jsonl"))
+        self.assertIn("turns", ra.record_paths(RUN, "claude", "interactive", None))
+
+    def test_process_info_reports_pids(self):
+        info = ra.process_info({"foreground": {"name": "claude", "pid": 42}, "child": {"name": "claude", "pid": 41}, "last_exit": None})
+        self.assertEqual(info, {"foreground": "claude", "pid": 42, "child_pid": 41, "last_exit": None})
+
+    def test_launch_summary_is_short(self):
+        rec = {"assignment_id": "a-1", "state": "launched", "paths": {"run_dir": "/r"},
+               "target": {"session_id": S, "window_id": "window:1", "block_id": B, "label": "a-1"}, "worker": {"agent": "claude"}}
+        self.assertEqual(set(ra.launch_summary(rec)), {"assignment_id", "state", "run_dir", "session_id", "window_id", "block_id"})
+
+
 class CliGuards(unittest.TestCase):
     def setUp(self):
         self.orig = ra.RUN
@@ -417,6 +545,21 @@ class CliGuards(unittest.TestCase):
         code, msg = self.run_cli("launch", "--agent", "claude", "--session", S, "--new-window", "--cwd", "/tmp", "--brief", "/dev/null", "--assignment-id", "a-dup")
         self.assertEqual(code, 5)
         self.assertIn("orphan", msg)
+
+    def test_refuses_missing_agent_cwd_or_brief_before_creating_anything(self):
+        base = ["launch", "--session", S, "--new-window", "--assignment-id", "a-req"]
+        for missing, rest in (("--agent", ["--cwd", "/tmp", "--brief", "/dev/null"]),
+                              ("--cwd", ["--agent", "claude", "--brief", "/dev/null"]),
+                              ("--brief", ["--agent", "claude", "--cwd", "/tmp"])):
+            code, msg = self.run_cli(*base, *rest)
+            self.assertEqual(code, 2, missing)
+            self.assertIn(missing, msg)
+        self.assertFalse((pathlib.Path(self.tmp.name) / "a-req").exists())
+
+    def test_stale_stream_dir_refused(self):
+        d = pathlib.Path(self.tmp.name) / "a-str"; d.mkdir(); (d / "stream.jsonl").write_text("{}")
+        code, _ = self.run_cli("launch", "--agent", "claude", "--session", S, "--new-window", "--cwd", "/tmp", "--brief", "/dev/null", "--assignment-id", "a-str")
+        self.assertEqual(code, 5)
 
     def test_stale_result_dir_refused(self):
         d = pathlib.Path(self.tmp.name) / "a-old"; d.mkdir(); (d / "result.json").write_text("{}")
