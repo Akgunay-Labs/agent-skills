@@ -86,9 +86,22 @@ def dialog_open(capture):
     return any(m in capture for m in STARTUP_DIALOGS + ("Allow command", "Would you like to run", "Approve", "Esc to cancel"))
 
 
+def run_dir_rule(run_dir):
+    """Allow rule that makes the run dir writable and editable (Edit rules cover Write). Claude reads `/path` as
+    project-relative; an absolute path needs `//` (live 2026-10-11, Claude Code 2.1.296)."""
+    return f"Edit(/{os.path.abspath(run_dir)}/**)"
+
+
+def banner(agent, aid, run_dir):
+    """One line printed before exec, so a blank process-mode pane is explained."""
+    msg = f"rex_assign {aid}: headless {agent} worker, no live output here until it exits. Progress: rex_assign.py status {aid}. Run dir: {run_dir}"
+    return "printf '%s\\n' " + shlex.quote(msg)
+
+
 def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=None, effort=None,
                          worktree=False, cwd=None, assignment_id=None, resume_of=None, prompt=None, helper=None):
-    """Return the `sh -c` payload. Starts with exec so the agent is the block's foreground process."""
+    """Return the `sh -c` payload. The agent is exec'd so it is the block's foreground process; process mode
+    prints a one-line banner first."""
     run_dir = pathlib.Path(run_dir)
     aid = assignment_id or run_dir.name
     prompt = prompt or brief_pointer(run_dir)
@@ -106,12 +119,11 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
             parts += ["--worktree"]
         if mode == "process":
             parts += ["--permission-prompts", "none", "--add-dir", str(run_dir)]
-            if policy.allow:
-                parts += ["--allowedTools", *policy.allow]
-            parts += ["--output-format", "json"]
+            parts += ["--allowedTools", *policy.allow, run_dir_rule(run_dir)]
+            parts += ["--output-format", "stream-json", "--verbose"]  # streamed so status can show progress; wait extracts result.json
             parts += (["--resume", resume_of] if resume_of else ["--session-id", agent_session_id])
             parts += ["--name", aid, prompt]  # --name is not variadic, so the prompt is safe after it
-            return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "result.json"))
+            return banner(agent, aid, run_dir) + "; " + " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "stream.jsonl"))
         if policy.allow:
             parts += ["--allowedTools", *policy.allow]
         parts += ["--settings", str(run_dir / "claude-settings.json"), "--session-id", agent_session_id, "--name", aid]
@@ -130,7 +142,7 @@ def build_worker_command(agent, mode, policy, run_dir, agent_session_id, model=N
             if worktree:
                 parts += ["--worktree"]
             parts += [prompt]
-            return " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "events.jsonl"))
+            return banner(agent, aid, run_dir) + "; " + " ".join(q(p) for p in parts) + " > " + q(str(run_dir / "events.jsonl"))
         parts = ["exec", "codex", "--no-daemon", "-s", codex_sandbox(policy), "-c", codex_notify_override(aid, helper or HELPER), "-c", "shell_environment_policy.inherit=all",
                  "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(run_dir)])]  # notify appends to RUN_DIR/turns.jsonl from inside the sandbox
         if model:
@@ -167,18 +179,124 @@ def classify(exit_code, result_path, agent):
             return "failed", f"subtype={r.get('subtype')} is_error={r.get('is_error')}"
         denials = r.get("permission_denials") or []
         if denials:
-            tools = sorted({d.get("tool_name", "?") for d in denials})
-            return "completed-with-denials", "denied tools: " + ", ".join(tools)
+            return "completed-with-denials", "denied: " + " | ".join(denial_lines(denials))
         return "completed-unreviewed", (r.get("result") or "")[:200]
     # codex: result_path is events.jsonl, last message beside it
-    lines = [l for l in result_path.read_text().splitlines() if l.strip()]
-    types = [json.loads(l).get("type") for l in lines if l.startswith("{")]
+    types = [e.get("type") for e in read_jsonl(result_path)]
     last = result_path.with_name("last-message.md")
     if "turn.completed" in types and last.exists() and last.read_text().strip():
         return "completed-unreviewed", last.read_text()[:200]
     if "turn.completed" in types:
         return "exited-without-result", "turn completed but last-message.md is empty (no deliverable reported)"
     return "exited-without-result", "no turn.completed in events.jsonl"
+
+
+def read_jsonl(path):
+    """Parsed lines of a JSONL file; a missing file or a truncated line (worker killed mid-write) is skipped."""
+    path = pathlib.Path(path)
+    if not path.exists():
+        return []
+    out = []
+    for l in path.read_text().splitlines():
+        try:
+            out.append(json.loads(l))
+        except json.JSONDecodeError:
+            pass
+    return [e for e in out if isinstance(e, dict)]
+
+
+def tool_label(tool, inp, width=80):
+    """`Bash: <command>` or `<Tool> <path|url|pattern>`, one line, cut to width."""
+    inp = inp or {}
+    if inp.get("command"):
+        line = f"{tool}: {inp['command']}"
+    else:
+        arg = inp.get("file_path") or inp.get("url") or inp.get("path") or inp.get("pattern") or inp.get("query")
+        line = f"{tool} {arg}" if arg else tool
+    line = line.replace("\n", " ")
+    return line if len(line) <= width else line[:width - 1] + "…"
+
+
+def denial_lines(denials):
+    return [tool_label(d.get("tool_name", "?"), d.get("tool_input")) for d in denials]
+
+
+def deliverable_denied(denials, deliverable):
+    """True when a denied file edit targeted the deliverable: the file exists but misses a change the worker wanted."""
+    if not deliverable:
+        return False
+    target = os.path.abspath(deliverable)
+    return any(d.get("tool_name") in ("Edit", "Write", "MultiEdit", "NotebookEdit")
+               and (d.get("tool_input") or {}).get("file_path")
+               and os.path.abspath(d["tool_input"]["file_path"]) == target for d in denials)
+
+
+def result_from_stream(stream_path, result_path):
+    """Write the last `type=result` event of a Claude stream-json file as result.json. False when there is none."""
+    results = [e for e in read_jsonl(stream_path) if e.get("type") == "result"]
+    if not results:
+        return False
+    pathlib.Path(result_path).write_text(json.dumps(results[-1]) + "\n")
+    return True
+
+
+def stream_progress(path, agent, tail=5):
+    """Tool tally and the last few actions from a worker's live stream (Claude stream.jsonl, Codex events.jsonl)."""
+    events, tools, last, denied = read_jsonl(path), {}, [], 0
+    for e in events:
+        if agent == "claude":
+            if e.get("type") == "system" and e.get("subtype") == "permission_denied":
+                denied += 1
+            for c in ((e.get("message") or {}).get("content") or []) if e.get("type") == "assistant" else []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    tools[c.get("name")] = tools.get(c.get("name"), 0) + 1
+                    last.append(tool_label(c.get("name"), c.get("input")))
+        elif e.get("type") == "item.completed":
+            item = e.get("item") or {}
+            kind = item.get("type", "?")
+            tools[kind] = tools.get(kind, 0) + 1
+            last.append(tool_label("shell", {"command": item.get("command")}) if kind == "command_execution" else kind)
+    return {"events": len(events), "tools": tools, "last": last[-tail:], "denied": denied}
+
+
+def detect_controller(env):
+    """Who is driving the helper: an explicit REX_ORCH_CONTROLLER, else Claude Code (CLAUDECODE) or Codex (CODEX_THREAD_ID).
+    CLAUDECODE wins because Claude Code plugins can export CODEX_* names of their own."""
+    if env.get("REX_ORCH_CONTROLLER"):
+        return env["REX_ORCH_CONTROLLER"]
+    if env.get("CLAUDECODE"):
+        return "claude-code"
+    if env.get("CODEX_THREAD_ID"):
+        return "codex"
+    return "unknown"
+
+
+def window_id_from_inspect(data):
+    return ((data or {}).get("block") or {}).get("window_id")
+
+
+def record_paths(run_dir, agent, mode, deliverable):
+    """Paths recorded for an assignment; each names a file this agent and mode really write."""
+    run_dir = pathlib.Path(run_dir)
+    p = {"run_dir": str(run_dir), "brief": str(run_dir / "brief.md"),
+         "result": str(run_dir / ("result.json" if agent == "claude" else "events.jsonl")),
+         "review": str(run_dir / "review.json"), "deliverable": str(run_dir / deliverable) if deliverable else None}
+    if mode == "process":
+        p["stream"] = str(run_dir / ("stream.jsonl" if agent == "claude" else "events.jsonl"))
+    else:
+        p["turns"] = str(run_dir / "turns.jsonl")
+    return p
+
+
+def process_info(proc):
+    fg, child = proc.get("foreground") or {}, proc.get("child") or {}
+    return {"foreground": fg.get("name"), "pid": fg.get("pid"), "child_pid": child.get("pid"), "last_exit": proc.get("last_exit")}
+
+
+def launch_summary(rec):
+    t = rec["target"]
+    return {"assignment_id": rec["assignment_id"], "state": rec["state"], "run_dir": rec["paths"]["run_dir"],
+            "session_id": t["session_id"], "window_id": t.get("window_id"), "block_id": t["block_id"]}
 
 
 def resolve_owner(as_owner, whoami, external=False):
@@ -221,7 +339,7 @@ def session_id_for(agent, resume_of, fresh):
 
 def apply_deliverable(state, deliverable_path):
     """A completed worker without the file the brief asked for is not complete."""
-    if state == "completed-unreviewed" and deliverable_path is not None and not pathlib.Path(deliverable_path).exists():
+    if state in ("completed-unreviewed", "completed-with-denials") and deliverable_path is not None and not pathlib.Path(deliverable_path).exists():
         return "completed-without-deliverable"
     return state
 
@@ -405,12 +523,16 @@ def cmd_launch(a):
     if a.anchor and not a.anchor.startswith("block:"):
         print("--anchor must be a full block:<uuid> ID", file=sys.stderr)
         return EXIT_USAGE
+    missing = [f for f, v in (("--agent", a.agent), ("--cwd", a.cwd), ("--brief", a.brief)) if not v]
+    if missing:
+        print("launch needs " + ", ".join(missing), file=sys.stderr)
+        return EXIT_USAGE
     aid = a.assignment_id or f"a-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
     run_dir = RUNS_ROOT / aid
     if (run_dir / "launching").exists() and not (run_dir / "assignment.json").exists():
         print(f"launch marker exists for {aid} without a record: inspect the session layout for an orphan block before retrying (rex block ls -s {a.session} --json), then move {run_dir} to Trash", file=sys.stderr)
         return EXIT_MARKER
-    if run_dir.exists() and any((run_dir / f).exists() for f in ("result.json", "assignment.json", "events.jsonl")):
+    if run_dir.exists() and any((run_dir / f).exists() for f in ("result.json", "assignment.json", "events.jsonl", "stream.jsonl")):
         print(f"run dir {run_dir} already holds results; use a fresh --assignment-id", file=sys.stderr)
         return EXIT_MARKER
     rc, who, out, err = rex("whoami", "--json")
@@ -435,24 +557,22 @@ def cmd_launch(a):
         return EXIT_TARGET if r.returncode == 3 else (EXIT_SERVER if r.returncode == 4 else 1)
     created = json.loads(r.stdout)
     block_id = created["block_ids"][0]
+    window_id = created.get("window_id") or window_id_from_inspect(rex("block", "inspect", "-s", a.session, block_id, "--json")[1])
     rec = {"assignment_id": aid, "role": a.role,
            "owner": dict(zip(("kind", "block_id"), resolve_owner(a.as_owner, who, external=a.external)), controller=a.controller),
            "server": {"endpoint": who.get("endpoint"), "instance_id": who.get("instance_id"), "host_id": who.get("host_id")},
-           "target": {"session_id": a.session, "window_id": created.get("window_id"), "block_id": block_id, "label": a.label or aid},
+           "target": {"session_id": a.session, "window_id": window_id, "block_id": block_id, "label": a.label or aid},
            "worker": {"agent": a.agent, "mode": a.mode, "model": a.model, "effort": a.effort,
                       "permission_policy": {"mode": policy.mode, "allowed_tools": policy.allow, "prompts": "none" if a.mode == "process" else "interactive"},
                       "cwd": a.cwd, "agent_session_id": agent_session_id, "resume_of": a.resume_of},
-           "paths": {"run_dir": str(run_dir), "brief": str(run_dir / "brief.md"),
-                     "result": str(run_dir / ("result.json" if a.agent == "claude" else "events.jsonl")),
-                     "review": str(run_dir / "review.json"), "turns": str(run_dir / "turns.jsonl"),
-                     "deliverable": str(run_dir / a.deliverable) if a.deliverable else None},
+           "paths": record_paths(run_dir, a.agent, a.mode, a.deliverable),
            "state": "launched", "launched_at": now_iso(), "exit": None, "review": None, "sends": []}
     save_record(rec)
     (run_dir / "launching").unlink(missing_ok=True)
     if a.mode == "interactive":
         rec["state"] = wait_ready(rec)
         save_record(rec)
-    print(json.dumps(rec, indent=2))
+    print(json.dumps(rec if a.json_out else launch_summary(rec), indent=2))
     return 0
 
 
@@ -476,8 +596,9 @@ def wait_ready(rec, limit=35):
         time.sleep(1.5)
 
 
-def parse_wait(rc, out):
-    """('exit', code) for a real child exit; otherwise the rex-side outcome: timeout, not-found, server-unreachable, interrupted, rex-error."""
+def parse_wait(rc, out, err=""):
+    """('exit', code) for a real child exit; otherwise the rex-side outcome: timeout, not-found, server-unreachable, interrupted, rex-error.
+    Exit 1 without a payload is a timeout only when stderr says so; exit 1 is also rex's generic failure."""
     payload = None
     for line in out.splitlines():
         if line.startswith("{"):
@@ -487,7 +608,9 @@ def parse_wait(rc, out):
                 pass
     if payload is not None and "exit_code" in payload:
         return "exit", payload["exit_code"]
-    return {1: ("timeout", None), 3: ("not-found", None), 4: ("server-unreachable", None), 130: ("interrupted", None)}.get(rc, ("rex-error", rc))
+    if rc == 1:
+        return ("timeout", None) if "timed out" in err else ("rex-error", 1)
+    return {3: ("not-found", None), 4: ("server-unreachable", None), 130: ("interrupted", None)}.get(rc, ("rex-error", rc))
 
 
 def server_check(rec):
@@ -507,13 +630,16 @@ def cmd_wait(a):
     if stale == "server-unreachable":
         print(json.dumps({"state": rec["state"], "detail": "rex server unreachable; record unchanged"})); return 1
     rc, _, out, err = rex("wait", "-s", sid, "--for", a.for_, "--json", b, json_out=False)
-    kind, exit_code = parse_wait(rc, out)
+    kind, exit_code = parse_wait(rc, out, err)
     if kind == "not-found":
         rec["state"] = "abandoned:block-closed"; save_record(rec)
         print(json.dumps({"state": rec["state"], "detail": err.strip()})); return 1
     if kind in ("server-unreachable", "interrupted", "rex-error"):
         print(json.dumps({"state": rec["state"], "detail": f"rex wait ended with {kind} ({err.strip()[:200]}); worker may still be running; record unchanged"})); return 1
-    state, summary = classify(exit_code, rec["paths"]["result"], rec["worker"]["agent"])
+    paths, agent = rec["paths"], rec["worker"]["agent"]
+    if agent == "claude" and paths.get("stream") and exit_code is not None:
+        result_from_stream(paths["stream"], paths["result"])
+    state, summary = classify(exit_code, paths["result"], agent)
     state = apply_deliverable(state, rec["paths"].get("deliverable"))
     if state == "completed-without-deliverable":
         summary = f"worker reported success but {rec['paths']['deliverable']} is missing; " + summary
@@ -522,9 +648,23 @@ def cmd_wait(a):
     rec["exit"] = None if exit_code is None else {"code": exit_code, "at": now_iso()}
     state = next_wait_state(rec, state)
     rec["state"] = state; save_record(rec)
-    out_obj = {"assignment_id": rec["assignment_id"], "state": state, "exit": rec["exit"], "summary": summary, "result_path": rec["paths"]["result"]}
+    out_obj = {"assignment_id": rec["assignment_id"], "state": state, "exit": rec["exit"], "summary": summary, "result_path": paths["result"]}
+    denials = read_denials(paths["result"]) if agent == "claude" else []
+    if denials:
+        out_obj["denials"] = denial_lines(denials)
+    if deliverable_denied(denials, paths.get("deliverable")):
+        out_obj["warning"] = "a denied edit targeted the deliverable: it misses a change the worker wanted (see permission_denials in result.json)"
+    if paths.get("stream"):
+        out_obj["tools_used"] = stream_progress(paths["stream"], agent)["tools"]
     print(json.dumps(out_obj, indent=2))
     return 0 if state in ("completed-unreviewed", "completed-with-denials") else 1
+
+
+def read_denials(result_path):
+    try:
+        return json.loads(pathlib.Path(result_path).read_text()).get("permission_denials") or []
+    except (OSError, ValueError, AttributeError):
+        return []
 
 
 def cmd_review(a):
@@ -554,12 +694,17 @@ def cmd_status(a):
     if rc == 3:
         rec["state"] = "abandoned:block-closed"; save_record(rec); info["state"] = rec["state"]
         print(json.dumps(info, indent=2)); return 1
-    info["process"] = {"foreground": (proc.get("foreground") or {}).get("name"), "last_exit": proc.get("last_exit")}
+    info["process"] = process_info(proc)
     _, st = block_call(sid, b, "program_status")
     recs = st.get("records", [])
     info["program_status"] = [{**r, "fresh": r.get("updated_at", "") > rec.get("launched_at", "")} for r in recs]
     turns = read_turns(rec["paths"]["run_dir"])
-    info["turns_tail"] = turns[-5:]
+    if turns:
+        info["turns_tail"] = turns[-5:]
+    if rec["paths"].get("stream"):
+        info["progress"] = stream_progress(rec["paths"]["stream"], rec["worker"]["agent"])
+    if rec["paths"].get("deliverable"):
+        info["deliverable_exists"] = pathlib.Path(rec["paths"]["deliverable"]).exists()
     if rec["worker"]["mode"] == "interactive":
         last_sent = (rec.get("sends") or [{}])[-1].get("sent_at") or rec.get("launched_at", "")
         live, ev = watch_outcome(turns, [{"name": "program_status_changed", "ts": r.get("updated_at", ""), "record": r} for r in recs], last_sent, sends=[x["sent_at"] for x in rec.get("sends", [])])
@@ -784,9 +929,10 @@ def main(argv=None):
         sp.add_argument("--allow", action="append", help="claude --allowedTools entry (repeatable)")
         sp.add_argument("--worktree", action="store_true"); sp.add_argument("--label"); sp.add_argument("--osc-status", action="store_true")
         sp.add_argument("--assignment-id"); sp.add_argument("--prompt", help="override the one-line prompt (default points at brief.md)")
-        sp.add_argument("--as-owner", help="block id to record as owner (outside controller claiming a pane, or a lead overriding whoami)"); sp.add_argument("--controller", default=os.environ.get("REX_ORCH_CONTROLLER", "unknown"))
+        sp.add_argument("--as-owner", help="block id to record as owner (outside controller claiming a pane, or a lead overriding whoami)"); sp.add_argument("--controller", default=detect_controller(os.environ))
         sp.add_argument("--external", action="store_true", help="outside controller: ignore any inherited REX_* pane identity")
         sp.add_argument("--deliverable", help="file the brief must produce, relative to the run dir (e.g. REPORT.md, review.json); wait downgrades completion when it is missing")
+        sp.add_argument("--json", dest="json_out", action="store_true", help="print the full record instead of the short summary")
         sp.add_argument("--resume-of", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("launch", help="create a block and start a worker"); launch_args(sp); sp.set_defaults(fn=cmd_launch)
