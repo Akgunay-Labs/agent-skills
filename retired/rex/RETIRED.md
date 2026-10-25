@@ -1,5 +1,7 @@
 # Retired: `rex` orchestration skill
 
+Successor: `skills/rex-orch` (2026-10-25), built per the checklist below.
+
 Retired 2026-10-25. Last release `rex/v0.1.0` (2026-10-10). This folder holds
 the final state: `v0.1.0` plus the field-note fixes from PR #1 (merged
 2026-10-25, untagged). This folder sits outside `skills/`, so
