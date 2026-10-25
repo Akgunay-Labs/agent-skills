@@ -2,7 +2,7 @@
 
 Written 2026-10-10 as `skills/skill-notes-rex/NOTES.md` and moved here when the skill was retired
 on 2026-10-25 (see `RETIRED.md`). They record one end-to-end use of the skill (then `skills/rex`)
-and the changes it suggested; none were made before retirement.
+and the changes it suggested. PR #1 (2026-10-25) addressed them; see `RETIRED.md`.
 
 ## Test context
 
