@@ -52,7 +52,8 @@ if [ "$mode" = prune ]; then
   done
   exit 0
 fi
-for n in "${names[@]}"; do
+for n in "${names[@]:-}"; do
+  [ -z "$n" ] && continue
   ensure_link "$AG/$n" "$SKILLS/$n" "~/.agents/skills/$n" || rc=1
   ensure_link "$CL/$n" "../../.agents/skills/$n" "~/.claude/skills/$n" || rc=1
 done

@@ -11,6 +11,7 @@ place, with no packaging step.
 ```text
 agent-skills/
 ├── skills/<name>/          one skill per folder: SKILL.md, references/, scripts/
+├── retired/<name>/         skills taken out of use, with a RETIRED.md saying why (never linked)
 ├── scripts/link-skills.sh  create or check the symlinks in ~/.agents/skills and ~/.claude/skills
 ├── scripts/check.py        validate frontmatter, word counts, and run each skill's tests
 └── .github/workflows/      runs scripts/check.py on every push
@@ -22,7 +23,7 @@ agent-skills/
 git clone git@github.com:Akgunay-Labs/agent-skills.git
 cd agent-skills
 bash scripts/link-skills.sh            # link every skill
-bash scripts/link-skills.sh rex        # link one skill
+bash scripts/link-skills.sh NAME       # link one skill
 bash scripts/link-skills.sh --check    # exit 1 on drift, change nothing
 ```
 
@@ -39,4 +40,8 @@ longer exists to the Trash.
 - `python3 scripts/check.py` must pass before a commit.
 - Nothing machine-specific or private goes in: no session or block IDs,
   no personal hook paths, no run state.
-- Removing anything means moving it to the Trash, not `rm`.
+- Removing anything means moving it to the Trash, not `rm`. A skill worth
+  remembering moves to `retired/` with a `RETIRED.md` instead.
+- Prefer the skill a tool's vendor ships (for example `rex skill setup`) over
+  writing one here. Write a skill only for what the vendor's does not cover,
+  and never reuse a vendor skill's name.
